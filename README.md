@@ -17,7 +17,7 @@ pip install astropy astroquery pandas numpy matplotlib tkinter
 ## 起動方法
 
 ```bash
-python3 refstar_gui.py
+python3.12 refstar_gui.py
 ```
 
 タブ切り替えで **固定モード** と **可変モード（小惑星）** を使い分ける。
