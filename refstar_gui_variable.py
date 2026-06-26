@@ -3,17 +3,21 @@
 refstar_gui_variable.py — Variable-mode panel for refstar_planner GUI.
 
 Asteroid mode: queries Horizons API for ephemeris over a time range,
-then checks reference star availability at each epoch via VizieR.
+then checks reference star availability at each epoch via VizieR
+for five photometric bands simultaneously:
+  optical : Pan-STARRS g, i
+  NIR     : 2MASS J, H, Ks
 
-Layout (right panel):
-  Top:    time vs. n_usable reference stars graph
-  Middle: time slider
-  Bottom: star field preview for the selected epoch
+Solar (neutral-reflection) colour offsets derived from Mamajek (2022)
+G2V row and Jester et al. (2005):
+  g = V + 0.286   i = V − 0.300
+  J = V − 1.198   H = V − 1.491   Ks = V − 1.564
 """
 
 from __future__ import annotations
 
 import datetime
+import sys
 import threading
 from typing import Optional
 
@@ -42,18 +46,46 @@ from refstar_planner import (
     circumscribed_radius,
     filter_rectangular_fov,
     parse_coord,
-    query_vizier_catalog,
     summarize,
 )
 
 # ---------------------------------------------------------------------------
+# Multi-band configuration
+# ---------------------------------------------------------------------------
+
+# Solar colour offsets: band_mag = V + offset  (neutral reflection = G2V colours)
+# g, i: from Jester (2005) + Mamajek (2022) G2V g−r=0.476 + SDSS solar i
+# J, H, Ks: Mamajek (2022) G2V: V−Ks=1.564, H−Ks=0.073, J−H=0.293
+SOLAR_OFFSETS: dict[str, float] = {
+    "g":  +0.286,
+    "i":  -0.300,
+    "J":  -1.198,
+    "H":  -1.491,
+    "Ks": -1.564,
+}
+BANDS = ["g", "i", "J", "H", "Ks"]
+BAND_COLORS = {
+    "g":  "#2166ac",
+    "i":  "#4dac26",
+    "J":  "#f4a441",
+    "H":  "#d6604d",
+    "Ks": "#9b59b6",
+}
+BAND_LINESTYLE = {"g": "-", "i": "-", "J": "--", "H": "--", "Ks": ":"}
+# (wide_df column name for mag, column name for mag_err)
+BAND_MAG_COLS: dict[str, tuple[str, str]] = {
+    "g":  ("gmag",  "e_gmag"),
+    "i":  ("imag",  "e_imag"),
+    "J":  ("Jmag",  "e_Jmag"),
+    "H":  ("Hmag",  "e_Hmag"),
+    "Ks": ("Kmag",  "e_Kmag"),
+}
+
+# ---------------------------------------------------------------------------
 # Observatory database  (code, lat_deg, lon_deg, alt_m, name_en, name_ja)
-# lat: positive = North, lon: positive = East, alt: metres
-# Horizons location dict uses elevation in km, converted at query time.
 # ---------------------------------------------------------------------------
 
 _OBS_DATA: list[tuple] = [
-    # ── Japan ──────────────────────────────────────────────────────────────
     ("W84",  34.576,  133.594,  372,
      "Okayama Astrophys. Obs. OAO (188cm)",    "岡山天体物理観測所 OAO"),
     ("D74",  34.690,  133.540,  386,
@@ -66,14 +98,12 @@ _OBS_DATA: list[tuple] = [
      "Nobeyama Radio Obs.",                     "野辺山電波観測所"),
     ("372",  35.674,  139.539,   58,
      "NAOJ Mitaka",                             "国立天文台 三鷹"),
-    # ── Hawaii ─────────────────────────────────────────────────────────────
     ("568",  19.826, -155.472, 4213,
      "Mauna Kea (Subaru / Keck / CFHT)",       "マウナケア天文台群"),
     ("T09",  20.707, -156.258, 3052,
      "Haleakala (MuSCAT3 / Pan-STARRS)",       "ハレアカラ天文台"),
     ("F65",  20.707, -156.258, 3065,
      "Haleakala (Pan-STARRS 1)",               "ハレアカラ PS1"),
-    # ── North America ──────────────────────────────────────────────────────
     ("695",  31.963, -111.600, 2064,
      "Kitt Peak National Obs. (KPNO)",         "キットピーク"),
     ("675",  33.356, -116.864, 1706,
@@ -82,7 +112,6 @@ _OBS_DATA: list[tuple] = [
      "F.L. Whipple Obs. (FLWO / SAO)",        "フレッドロレンスウィップル"),
     ("G96",  32.443, -110.789, 2791,
      "Mt. Lemmon Survey (CSS)",               "マウント・レモン"),
-    # ── South America ──────────────────────────────────────────────────────
     ("309", -24.625,  -70.403, 2635,
      "Cerro Paranal (VLT / ESO)",             "パラナル (VLT)"),
     ("304", -29.257,  -70.730, 2347,
@@ -91,27 +120,22 @@ _OBS_DATA: list[tuple] = [
      "Cerro Tololo (CTIO / DECam)",           "セロ・トロロ (CTIO)"),
     ("I11", -30.240,  -70.736, 2722,
      "Gemini South",                          "ジェミニ南"),
-    # ── Europe / Canary Islands ────────────────────────────────────────────
     ("950",  28.760,  -17.890, 2326,
      "La Palma (Roque de los Muchachos)",     "ラ・パルマ"),
     ("J04",  28.754,  -17.889, 2370,
      "Telescopio Nazionale Galileo (TNG)",   "TNG 3.6m"),
-    # ── Australia / Africa ─────────────────────────────────────────────────
     ("413", -31.273,  149.071, 1165,
      "Siding Spring Obs. (AAT)",             "サイディングスプリング"),
     ("074", -32.380,   20.811, 1760,
      "SAAO Sutherland",                      "南アフリカ天文台"),
-    # ── Special ────────────────────────────────────────────────────────────
     ("500",   0.000,    0.000,    0,
      "Geocenter (no parallax correction)",   "地心 (視差補正なし)"),
 ]
 
-# Index for fast lookup
 _OBS_BY_CODE: dict[str, tuple] = {row[0]: row for row in _OBS_DATA}
 
 
 def _search_obs(query: str, max_results: int = 10) -> list[str]:
-    """Return formatted 'CODE  Name' strings matching the query."""
     q = query.strip().lower()
     if not q:
         return [f"{r[0]}  {r[4]}" for r in _OBS_DATA[:max_results]]
@@ -126,12 +150,134 @@ def _search_obs(query: str, max_results: int = 10) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Telescope presets (same as fixed mode)
+# Telescope presets
 # ---------------------------------------------------------------------------
 
 from refstar_gui_fixed import (
     TELESCOPE_PRESETS, PRESET_MAP, PRESET_NAMES, DEFAULT_TELESCOPE, ASSESS_COLORS
 )
+
+# ---------------------------------------------------------------------------
+# Wide VizieR query helpers (module-level, called from background thread)
+# ---------------------------------------------------------------------------
+
+def _resolve_col(tbl: pd.DataFrame, name: str) -> Optional[str]:
+    if name in tbl.columns:
+        return name
+    lm = {c.lower(): c for c in tbl.columns}
+    return lm.get(name.lower())
+
+
+def _query_wide_ps(center, radius_arcmin: float,
+                   mag_min: float, mag_max: float) -> pd.DataFrame:
+    """Query Pan-STARRS DR2 for g and i bands in one VizieR call."""
+    try:
+        from astroquery.vizier import Vizier
+        from astropy import units as u
+    except ImportError:
+        return pd.DataFrame()
+
+    viz = Vizier(
+        columns=["RAJ2000", "DEJ2000", "objID", "gmag", "e_gmag", "imag", "e_imag"],
+        column_filters={"gmag": f"{mag_min:.2f}..{mag_max:.2f}"},
+        row_limit=-1,
+    )
+    viz.TIMEOUT = 120
+    try:
+        result = viz.query_region(center, radius=radius_arcmin * u.arcmin,
+                                  catalog="II/349/ps1")
+    except Exception as exc:
+        print(f"[WARN] PS wide query: {exc}", file=sys.stderr)
+        return pd.DataFrame()
+
+    if not result or len(result) == 0:
+        return pd.DataFrame()
+
+    tbl = result[0].to_pandas()
+    ra_c = _resolve_col(tbl, "RAJ2000")
+    dc_c = _resolve_col(tbl, "DEJ2000")
+    if ra_c is None or dc_c is None:
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["ra_deg"]  = pd.to_numeric(tbl[ra_c], errors="coerce")
+    out["dec_deg"] = pd.to_numeric(tbl[dc_c], errors="coerce")
+    sid = _resolve_col(tbl, "objID")
+    out["source_id"] = (tbl[sid].astype(str) if sid else
+                        [f"ps_{i}" for i in range(len(tbl))])
+    out["catalog"] = "panstarrs"
+    out["object_type"] = ""
+    out["color"] = np.nan
+
+    for band_col, err_col in [("gmag", "e_gmag"), ("imag", "e_imag")]:
+        bc = _resolve_col(tbl, band_col)
+        ec = _resolve_col(tbl, err_col)
+        out[band_col] = pd.to_numeric(tbl[bc], errors="coerce") if bc else np.nan
+        out[err_col]  = pd.to_numeric(tbl[ec], errors="coerce") if ec else np.nan
+
+    return out.dropna(subset=["ra_deg", "dec_deg"]).reset_index(drop=True)
+
+
+def _query_wide_2m(center, radius_arcmin: float,
+                   mag_min: float, mag_max: float) -> pd.DataFrame:
+    """Query 2MASS PSC for J, H, Ks bands in one VizieR call."""
+    try:
+        from astroquery.vizier import Vizier
+        from astropy import units as u
+    except ImportError:
+        return pd.DataFrame()
+
+    viz = Vizier(
+        columns=["RAJ2000", "DEJ2000", "2MASS",
+                 "Jmag", "e_Jmag", "Hmag", "e_Hmag", "Kmag", "e_Kmag"],
+        column_filters={"Jmag": f"{mag_min:.2f}..{mag_max:.2f}"},
+        row_limit=-1,
+    )
+    viz.TIMEOUT = 120
+    try:
+        result = viz.query_region(center, radius=radius_arcmin * u.arcmin,
+                                  catalog="II/246/out")
+    except Exception as exc:
+        print(f"[WARN] 2MASS wide query: {exc}", file=sys.stderr)
+        return pd.DataFrame()
+
+    if not result or len(result) == 0:
+        return pd.DataFrame()
+
+    tbl = result[0].to_pandas()
+    ra_c = _resolve_col(tbl, "RAJ2000")
+    dc_c = _resolve_col(tbl, "DEJ2000")
+    if ra_c is None or dc_c is None:
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["ra_deg"]  = pd.to_numeric(tbl[ra_c], errors="coerce")
+    out["dec_deg"] = pd.to_numeric(tbl[dc_c], errors="coerce")
+    sid = _resolve_col(tbl, "2MASS")
+    out["source_id"] = (tbl[sid].astype(str) if sid else
+                        [f"2m_{i}" for i in range(len(tbl))])
+    out["catalog"] = "2mass"
+    out["object_type"] = ""
+    out["color"] = np.nan
+
+    for band_col, err_col in [("Jmag", "e_Jmag"), ("Hmag", "e_Hmag"), ("Kmag", "e_Kmag")]:
+        bc = _resolve_col(tbl, band_col)
+        ec = _resolve_col(tbl, err_col)
+        out[band_col] = pd.to_numeric(tbl[bc], errors="coerce") if bc else np.nan
+        out[err_col]  = pd.to_numeric(tbl[ec], errors="coerce") if ec else np.nan
+
+    return out.dropna(subset=["ra_deg", "dec_deg"]).reset_index(drop=True)
+
+
+def _band_view(wide_df: pd.DataFrame, band: str) -> pd.DataFrame:
+    """Return a copy of wide_df with 'mag'/'mag_err' set to the requested band."""
+    mag_col, err_col = BAND_MAG_COLS[band]
+    if wide_df is None or wide_df.empty or mag_col not in wide_df.columns:
+        return pd.DataFrame()
+    df = wide_df.copy()
+    df["mag"]     = df[mag_col]
+    df["mag_err"] = df[err_col] if err_col in df.columns else np.nan
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -139,20 +285,19 @@ from refstar_gui_fixed import (
 # ---------------------------------------------------------------------------
 
 class VariableModePanel(ttk.Frame):
-    """Asteroid tracking mode: Horizons ephemeris + time-series reference star check."""
+    """Asteroid tracking mode: Horizons ephemeris + multi-band reference star check."""
 
     def __init__(self, parent) -> None:
         super().__init__(parent)
 
-        # ── State ─────────────────────────────────────────────────────────
-        self._running    = False
-        self._ephem: Optional[pd.DataFrame] = None   # Horizons result
-        self._cache: list[dict] = []                 # per-epoch results
-        self._wide_df: Optional[pd.DataFrame] = None # cached VizieR stars
-        self._cursor_line = None                     # axvline in time graph
+        self._running   = False
+        self._ephem: Optional[pd.DataFrame] = None
+        self._cache: list[dict] = []
+        self._wide_ps: Optional[pd.DataFrame] = None   # Pan-STARRS wide query
+        self._wide_2m: Optional[pd.DataFrame] = None   # 2MASS wide query
+        self._cursor_line = None
         self._step_idx    = 0
 
-        # ── Tkinter variables ──────────────────────────────────────────────
         self.var_target     = tk.StringVar()
         self.var_obs_search = tk.StringVar()
         self.var_mpc_code   = tk.StringVar(value="568")
@@ -169,7 +314,6 @@ class VariableModePanel(ttk.Frame):
         self.var_h_arcmin   = tk.StringVar(value="6")
         self.var_h_arcsec   = tk.StringVar(value="6")
         self.var_pa         = tk.StringVar(value="0")
-        self.var_catalog    = tk.StringVar(value="panstarrs")
         self.var_delta_mag  = tk.StringVar(value="3.0")
         self.var_mag_err    = tk.StringVar(value="0.05")
         self.var_min_sep    = tk.StringVar(value="5")
@@ -183,13 +327,11 @@ class VariableModePanel(ttk.Frame):
         self._build_ui()
         self._on_telescope_change()
 
-        # Watch obs-search field
         self.var_obs_search.trace_add("write", lambda *_: self._on_obs_search_change())
 
     # ── Build UI ──────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        # ── PanedWindow (left input | right output) ─────────────────────────
         paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         paned.grid(row=0, column=0, sticky="nsew")
 
@@ -206,22 +348,17 @@ class VariableModePanel(ttk.Frame):
         vsb.grid(row=0, column=1, sticky="ns")
 
         left = ttk.Frame(left_canvas, padding=(10, 10, 6, 10))
-
-        # Store window ID so we can update its width when the canvas resizes
         _win_id = left_canvas.create_window((0, 0), window=left, anchor="nw")
 
-        # Keep inner frame width == canvas width; also update status wraplength
         def _on_canvas_resize(event):
             left_canvas.itemconfig(_win_id, width=event.width)
             self.lbl_status.config(wraplength=max(100, event.width - 20))
         left_canvas.bind("<Configure>", _on_canvas_resize)
 
-        # Update scroll region whenever the inner frame grows/shrinks vertically
         left.bind("<Configure>",
                   lambda e: left_canvas.configure(
                       scrollregion=left_canvas.bbox("all")))
 
-        # Mouse-wheel / trackpad scrolling with position check
         def _on_scroll_var(event):
             try:
                 lx, ly = left_outer.winfo_rootx(), left_outer.winfo_rooty()
@@ -344,7 +481,7 @@ class VariableModePanel(ttk.Frame):
         for v in (self.var_start, self.var_end, self.var_step_val, self.var_step_unit):
             v.trace_add("write", lambda *_: self._update_step_info())
 
-        # 視野 / FoV
+        # ── 視野 / FoV ───────────────────────────────────────────────────────
         ff = ttk.LabelFrame(left, text="🔭 視野 / FoV", padding=8)
         ff.grid(row=r, column=0, sticky="ew", pady=(0, 8)); r += 1
 
@@ -379,60 +516,50 @@ class VariableModePanel(ttk.Frame):
         ttk.Entry(ff, textvariable=self.var_pa, width=7).grid(row=4, column=1, pady=(4, 0))
         ttk.Label(ff, text="°", foreground="#666").grid(row=4, column=2, padx=(2, 0))
 
-        # カタログ
-        fcat = ttk.LabelFrame(left, text="📚 カタログ", padding=8)
-        fcat.grid(row=r, column=0, sticky="ew", pady=(0, 8)); r += 1
-
-        for i, (label, val) in enumerate([
-            ("Pan-STARRS (推奨)", "panstarrs"),
-            ("Gaia DR3",          "gaia"),
-            ("2MASS",             "2mass"),
-        ]):
-            ttk.Radiobutton(fcat, text=label, variable=self.var_catalog, value=val).grid(
-                row=i // 2, column=i % 2, sticky="w", padx=6, pady=1)
-
-        # 等級条件
-        fmag = ttk.LabelFrame(left, text="🌟 等級条件", padding=8)
+        # ── 等級条件 (中性反射を仮定して全バンドに同一条件を適用) ──────────────
+        fmag = ttk.LabelFrame(left, text="🌟 等級条件 (全バンド共通)", padding=8)
         fmag.grid(row=r, column=0, sticky="ew", pady=(0, 8)); r += 1
         fmag.columnconfigure(1, weight=1)
 
-        ttk.Label(fmag, text="小惑星 V 等級").grid(
-            row=0, column=0, sticky="e", padx=(0, 6))
-        vmag_row = ttk.Frame(fmag)
-        vmag_row.grid(row=0, column=1, sticky="ew")
-        self.ent_vmag = ttk.Entry(vmag_row, width=7, state="readonly")
-        self.ent_vmag.grid(row=0, column=0)
-        ttk.Label(vmag_row, text="mag (Horizons から自動取得)",
-                  foreground="#666", font=("", 9)).grid(row=0, column=1, padx=(4, 0))
-
+        # V mag info label (populated from Horizons)
         self.lbl_vmag_range = ttk.Label(
-            fmag, text="V等級範囲: —", foreground="#888888", font=("", 9))
+            fmag, text="小惑星 V 等級: — (Horizons から自動表示)",
+            foreground="#888888", font=("", 9))
         self.lbl_vmag_range.grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(2, 4))
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
-        ttk.Label(fmag, text="± ΔMag").grid(row=2, column=0, sticky="e", padx=(0, 6))
-        delta_row = ttk.Frame(fmag)
-        delta_row.grid(row=2, column=1, sticky="w")
-        ttk.Entry(delta_row, textvariable=self.var_delta_mag, width=6).grid(row=0, column=0)
-        ttk.Label(delta_row, text="mag", foreground="#666").grid(
-            row=0, column=1, padx=(4, 0))
+        # Band offsets info
+        ttk.Label(fmag,
+                  text="中性反射仮定:  g=V+0.29  i=V−0.30  J=V−1.20  H=V−1.49  Ks=V−1.56",
+                  foreground="#666666", font=("", 8)).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
         ttk.Separator(fmag, orient="horizontal").grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(4, 6))
+            row=2, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
-        ttk.Label(fmag, text="等級誤差 ≤").grid(row=4, column=0, sticky="e", padx=(0, 6))
+        ttk.Label(fmag, text="± ΔMag").grid(row=3, column=0, sticky="e", padx=(0, 6))
+        dmag_row = ttk.Frame(fmag)
+        dmag_row.grid(row=3, column=1, sticky="w")
+        ttk.Entry(dmag_row, textvariable=self.var_delta_mag, width=7).grid(row=0, column=0)
+        ttk.Label(dmag_row, text="mag  (各バンド中心 ±)", foreground="#666",
+                  font=("", 9)).grid(row=0, column=1, padx=(4, 0))
+
+        ttk.Separator(fmag, orient="horizontal").grid(
+            row=4, column=0, columnspan=2, sticky="ew", pady=(6, 6))
+
+        ttk.Label(fmag, text="等級誤差 ≤").grid(row=5, column=0, sticky="e", padx=(0, 6))
         ttk.Entry(fmag, textvariable=self.var_mag_err, width=7).grid(
-            row=4, column=1, sticky="w")
+            row=5, column=1, sticky="w")
 
         ttk.Label(fmag, text="最小離角").grid(
-            row=5, column=0, sticky="e", padx=(0, 6), pady=(4, 0))
+            row=6, column=0, sticky="e", padx=(0, 6), pady=(4, 0))
         sep_row = ttk.Frame(fmag)
-        sep_row.grid(row=5, column=1, sticky="w", pady=(4, 0))
+        sep_row.grid(row=6, column=1, sticky="w", pady=(4, 0))
         ttk.Entry(sep_row, textvariable=self.var_min_sep, width=7).grid(row=0, column=0)
         ttk.Label(sep_row, text='"', foreground="#666").grid(
             row=0, column=1, padx=(2, 0))
 
-        # 判定閾値
+        # ── 判定閾値 ─────────────────────────────────────────────────────────
         fthr = ttk.LabelFrame(left, text="📊 判定閾値", padding=8)
         fthr.grid(row=r, column=0, sticky="ew", pady=(0, 8)); r += 1
 
@@ -447,7 +574,7 @@ class VariableModePanel(ttk.Frame):
             ttk.Entry(fthr, textvariable=var, width=5).grid(
                 row=i // 2, column=col + 1, sticky="w", padx=(0, 12))
 
-        # ── Buttons ────────────────────────────────────────────────────────
+        # ── Buttons ──────────────────────────────────────────────────────────
         fbtn = ttk.Frame(left)
         fbtn.grid(row=r, column=0, sticky="ew"); r += 1
 
@@ -463,23 +590,25 @@ class VariableModePanel(ttk.Frame):
                                     justify="left")
         self.lbl_status.grid(row=r, column=0, sticky="w", pady=(6, 0))
 
-        # ── Right panel ─────────────────────────────────────────────────────
+        # ── Right panel ──────────────────────────────────────────────────────
         right = ttk.Frame(paned, padding=(4, 10, 10, 10))
         paned.add(right, weight=1)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(0, weight=2)   # time graph
-        right.rowconfigure(2, weight=3)   # star field
+        right.rowconfigure(0, weight=1)
 
-        # ── Two-subplot figure (time graph + star field) ────────────────────
-        self.fig = plt.figure(figsize=(7, 8), layout="constrained")
-        gs = self.fig.add_gridspec(2, 1, height_ratios=[1, 2], hspace=0.4)
-        self.ax_time  = self.fig.add_subplot(gs[0])   # top: time-series
-        self.ax_field = self.fig.add_subplot(gs[1])   # bottom: star field
+        # Figure: top=time graph (full width), bottom=5 FoV panels
+        self.fig = plt.figure(figsize=(12, 8), layout="constrained")
+        gs = self.fig.add_gridspec(2, 5, height_ratios=[1, 2])
+        self.ax_time = self.fig.add_subplot(gs[0, :])
+        self.ax_bands: dict[str, plt.Axes] = {
+            band: self.fig.add_subplot(gs[1, i])
+            for i, band in enumerate(BANDS)
+        }
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew", rowspan=3)
 
-        # ── Time slider (overlaid as a separate tkinter row below canvas) ──
+        # Time slider
         slider_frame = ttk.Frame(right)
         slider_frame.grid(row=3, column=0, sticky="ew", pady=(4, 0))
         slider_frame.columnconfigure(1, weight=1)
@@ -495,22 +624,21 @@ class VariableModePanel(ttk.Frame):
         self.slider.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
         self.slider.state(["disabled"])
 
-        # ── Navigation toolbar ─────────────────────────────────────────────
+        # Navigation toolbar
         toolbar_frame = ttk.Frame(right)
         toolbar_frame.grid(row=4, column=0, sticky="ew")
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
 
-        # ── Summary ────────────────────────────────────────────────────────
+        # Summary
         fsum = ttk.LabelFrame(right, text="📈 サマリ (現在のエポック)", padding=8)
         fsum.grid(row=5, column=0, sticky="ew", pady=(8, 0))
         fsum.columnconfigure(0, weight=1)
         self.lbl_summary = ttk.Label(
             fsum, text="— まだ計算していません —",
-            font=("", 10), wraplength=700, justify="left")
+            font=("", 10), wraplength=900, justify="left")
         self.lbl_summary.grid(row=0, column=0, sticky="w")
 
-        # Draw empty plots
         self._draw_empty_plots()
 
     # ── Observatory search ────────────────────────────────────────────────────
@@ -530,21 +658,15 @@ class VariableModePanel(ttk.Frame):
             self.var_lon.set(str(lon))
             self.var_alt.set(str(alt))
 
-    # ── Step-count estimate ────────────────────────────────────────────────────
+    # ── Step-count estimate ───────────────────────────────────────────────────
 
     def _update_step_info(self) -> None:
         try:
             start = datetime.datetime.strptime(self.var_start.get().strip(), "%Y-%m-%d %H:%M")
-            end   = datetime.datetime.strptime(self.var_end.get().strip(), "%Y-%m-%d %H:%M")
+            end   = datetime.datetime.strptime(self.var_end.get().strip(),   "%Y-%m-%d %H:%M")
             val   = float(self.var_step_val.get())
             unit  = self.var_step_unit.get()
-            if unit == "m":
-                step_min = val
-            elif unit == "h":
-                step_min = val * 60
-            else:
-                step_min = val * 1440
-
+            step_min = val * (1 if unit == "m" else 60 if unit == "h" else 1440)
             n = max(1, int((end - start).total_seconds() / 60 / step_min) + 1)
             self.lbl_step_info.config(
                 text=f"計: {n} エポック  (推定 1〜3 分)",
@@ -557,7 +679,6 @@ class VariableModePanel(ttk.Frame):
     def _on_telescope_change(self) -> None:
         name = self.var_tele.get()
         fov  = PRESET_MAP.get(name)
-
         if fov is None:
             for ent in (self.ent_w_arcmin, self.ent_w_arcsec,
                         self.ent_h_arcmin, self.ent_h_arcsec):
@@ -595,7 +716,6 @@ class VariableModePanel(ttk.Frame):
             return default
 
     def _horizons_location(self) -> object:
-        """Return location parameter for astroquery Horizons."""
         mpc = self.var_mpc_code.get().strip()
         try:
             lat = float(self.var_lat.get())
@@ -632,9 +752,6 @@ class VariableModePanel(ttk.Frame):
             msg = str(exc)
             if "ambiguous" in msg.lower():
                 candidates = self._parse_ambiguous_candidates(msg)
-
-                # Also try small-body search — catches asteroids absent from the
-                # major-body ambiguous list (e.g. "16 Psyche" for "Psyche")
                 try:
                     import re as _re
                     from astroquery.jplhorizons import Horizons as _H
@@ -651,7 +768,6 @@ class VariableModePanel(ttk.Frame):
                             candidates.append((sb_id, tname))
                 except Exception:
                     pass
-
                 if candidates:
                     self.after(0, self._verify_done, False, "")
                     self.after(0, self._show_candidate_picker, candidates)
@@ -660,32 +776,25 @@ class VariableModePanel(ttk.Frame):
 
     @staticmethod
     def _parse_ambiguous_candidates(msg: str) -> list[tuple[str, str]]:
-        """Parse Horizons 'Ambiguous target name' error into (id, name) pairs."""
         import re
         candidates = []
         past_dashes = False
         for line in msg.split("\n"):
-            # Detect the dashed separator line (e.g. "  -------  -----  ...")
             stripped = line.strip()
             if stripped and re.match(r"[-]+(\s+[-]+)+$", stripped):
                 past_dashes = True
                 continue
-            if not past_dashes:
+            if not past_dashes or not stripped:
                 continue
-            if not stripped:
-                continue
-            # Match: optional leading spaces, integer ID (may be negative), rest of line
             m = re.match(r"\s*(-?\d+)\s+(.+)", line)
             if m:
                 id_str = m.group(1).strip()
-                # Strip designation/alias columns (3+ spaces then non-space content)
                 name = re.sub(r"\s{3,}\S.*$", "", m.group(2)).strip()
                 if id_str and name:
                     candidates.append((id_str, name))
         return candidates
 
     def _show_candidate_picker(self, candidates: list[tuple[str, str]]) -> None:
-        """Populate the target combobox with ambiguous candidates and open it."""
         self._cand_map = {f"{id_str}   {name}": id_str for id_str, name in candidates}
         self.cb_target["values"] = list(self._cand_map.keys())
         self.lbl_target_status.config(
@@ -694,7 +803,6 @@ class VariableModePanel(ttk.Frame):
         self.cb_target.event_generate("<Down>")
 
     def _on_target_selected(self, _event=None) -> None:
-        """Called when user picks a candidate from the combobox dropdown."""
         display = self.cb_target.get()
         id_str = self._cand_map.get(display, display)
         self.var_target.set(id_str)
@@ -731,8 +839,7 @@ class VariableModePanel(ttk.Frame):
             datetime.datetime.strptime(start, "%Y-%m-%d %H:%M")
             datetime.datetime.strptime(end,   "%Y-%m-%d %H:%M")
         except ValueError:
-            messagebox.showwarning("入力エラー",
-                                   "日時形式が不正です。\n形式: YYYY-MM-DD HH:MM")
+            messagebox.showwarning("入力エラー", "日時形式が不正です。\n形式: YYYY-MM-DD HH:MM")
             return
 
         step = self.var_step_val.get().strip() + self.var_step_unit.get().strip()
@@ -743,27 +850,27 @@ class VariableModePanel(ttk.Frame):
             return
 
         params = {
-            "target": target,
-            "loc":    loc,
-            "start":  start,
-            "end":    end,
-            "step":   step,
-            "catalog":   self.var_catalog.get(),
+            "target":   target,
+            "loc":      loc,
+            "start":    start,
+            "end":      end,
+            "step":     step,
             "delta_mag": self._get_float(self.var_delta_mag, 3.0),
-            "max_err":   self._get_float(self.var_mag_err,   0.05),
-            "min_sep":   self._get_float(self.var_min_sep,   5.0),
-            "thr_good":  int(self._get_float(self.var_thr_good, 30)),
-            "thr_ok":    int(self._get_float(self.var_thr_ok,   10)),
-            "thr_marg":  int(self._get_float(self.var_thr_marg,  5)),
-            "fov_w":  fov_w,
-            "fov_h":  fov_h,
-            "pa_deg": self._get_float(self.var_pa, 0.0),
+            "max_err":  self._get_float(self.var_mag_err,  0.05),
+            "min_sep":  self._get_float(self.var_min_sep,  5.0),
+            "thr_good": int(self._get_float(self.var_thr_good, 30)),
+            "thr_ok":   int(self._get_float(self.var_thr_ok,   10)),
+            "thr_marg": int(self._get_float(self.var_thr_marg,  5)),
+            "fov_w":    fov_w,
+            "fov_h":    fov_h,
+            "pa_deg":   self._get_float(self.var_pa, 0.0),
         }
 
         self._running = True
         self._cache   = []
         self._ephem   = None
-        self._wide_df = None
+        self._wide_ps = None
+        self._wide_2m = None
         self.btn_run.config(state="disabled", text="⏳ 計算中...")
         self.btn_save.config(state="disabled")
         self.slider.state(["disabled"])
@@ -781,20 +888,16 @@ class VariableModePanel(ttk.Frame):
             self.after(0, self._finish_error, f"Horizons エラー: {exc}")
 
     def _run_horizons(self, params: dict) -> None:
-        """Step 1: fetch ephemeris from Horizons."""
         from astroquery.jplhorizons import Horizons
 
         obj = Horizons(
             id=params["target"],
             location=params["loc"],
-            epochs={"start": params["start"],
-                    "stop":  params["end"],
+            epochs={"start": params["start"], "stop": params["end"],
                     "step":  params["step"]},
         )
         eph = obj.ephemerides(quantities="1,9")
         df  = eph.to_pandas()
-
-        # Normalise column names to lowercase
         df.columns = [c.lower() for c in df.columns]
 
         required = {"ra", "dec"}
@@ -803,14 +906,8 @@ class VariableModePanel(ttk.Frame):
 
         df["ra"]  = pd.to_numeric(df["ra"],  errors="coerce")
         df["dec"] = pd.to_numeric(df["dec"], errors="coerce")
+        df["v"]   = pd.to_numeric(df["v"],   errors="coerce") if "v" in df.columns else np.nan
 
-        # V magnitude (may be absent or masked for some objects)
-        if "v" in df.columns:
-            df["v"] = pd.to_numeric(df["v"], errors="coerce")
-        else:
-            df["v"] = np.nan
-
-        # datetime string
         if "datetime_str" in df.columns:
             df["time_label"] = df["datetime_str"].astype(str)
         else:
@@ -832,48 +929,49 @@ class VariableModePanel(ttk.Frame):
             self.after(0, self._finish_error, f"VizieR エラー: {exc}")
 
     def _run_wide_query(self, params: dict) -> None:
-        """Step 2: one wide VizieR query covering all asteroid positions."""
         from astropy.coordinates import SkyCoord
         from astropy import units as u
 
-        eph  = self._ephem
+        eph   = self._ephem
         fov_w = params["fov_w"]
         fov_h = params["fov_h"]
 
         ra_vals  = eph["ra"].values
         dec_vals = eph["dec"].values
-
-        # Centroid of all positions
         mean_ra  = float(np.mean(ra_vals))
         mean_dec = float(np.mean(dec_vals))
         centroid = SkyCoord(ra=mean_ra * u.deg, dec=mean_dec * u.deg, frame="icrs")
 
-        # Max separation from centroid
-        stars = SkyCoord(ra=ra_vals * u.deg, dec=dec_vals * u.deg, frame="icrs")
-        max_sep_arcmin = centroid.separation(stars).to(u.arcmin).max().value
+        stars   = SkyCoord(ra=ra_vals * u.deg, dec=dec_vals * u.deg, frame="icrs")
+        max_sep = centroid.separation(stars).to(u.arcmin).max().value
 
-        # Total query radius
-        fov_r = circumscribed_radius(fov_w, fov_h)
-        query_r = max_sep_arcmin + fov_r + 2.0   # 2 arcmin buffer
+        fov_r   = circumscribed_radius(fov_w, fov_h)
+        query_r = max_sep + fov_r + 2.0
 
-        # Build magnitude bounds from Horizons V + ΔMag buffer
-        delta      = params["delta_mag"]
-        v_vals     = eph["v"].dropna()
+        delta   = params["delta_mag"]
+        v_vals  = self._ephem["v"].dropna()
         if len(v_vals) > 0:
-            v_mid = float(v_vals.mean())
+            v_mid   = float(v_vals.mean())
             v_range = float(v_vals.max() - v_vals.min())
-            mag_min = v_mid - delta - v_range / 2 - 0.5
-            mag_max = v_mid + delta + v_range / 2 + 0.5
         else:
-            mag_min, mag_max = 10.0, 22.0  # fallback when no V mag
+            v_mid   = 15.0   # fallback when Horizons has no V mag
+            v_range = 0.0
 
-        catalog = params["catalog"]
-        wide_df = query_vizier_catalog(
-            centroid, query_r, catalog, mag_min, mag_max)
-        self._wide_df = wide_df
+        buf = v_range / 2 + 0.5   # extra margin covering V variation + edge buffer
 
+        g_cen  = v_mid + SOLAR_OFFSETS["g"]
+        j_cen  = v_mid + SOLAR_OFFSETS["J"]
+        self._wide_ps = _query_wide_ps(centroid, query_r,
+                                        g_cen - delta - buf, g_cen + delta + buf)
+        self._wide_2m = _query_wide_2m(centroid, query_r,
+                                        j_cen - delta - buf, j_cen + delta + buf)
+
+        n_ps = len(self._wide_ps) if self._wide_ps is not None else 0
+        n_2m = len(self._wide_2m) if self._wide_2m is not None else 0
+        delta = params["delta_mag"]
         self.after(0, lambda: self.lbl_status.config(
-            text=f"Step 3/3: {len(eph)} エポック分をフィルタ中...",
+            text=f"Step 3/3: {len(eph)} エポック × 5 バンドをフィルタ中... "
+                 f"(±{delta} mag, PS={n_ps}星, 2MASS={n_2m}星)",
             foreground="#888888"))
 
         try:
@@ -882,64 +980,77 @@ class VariableModePanel(ttk.Frame):
             self.after(0, self._finish_error, f"フィルタ失敗: {exc}")
 
     def _run_filter_all(self, params: dict) -> None:
-        """Step 3: filter cached stars for every epoch."""
         from astropy.coordinates import SkyCoord
         from astropy import units as u
 
-        eph   = self._ephem
-        wide  = self._wide_df
-        cache = []
+        eph      = self._ephem
+        fov_w     = params["fov_w"]
+        fov_h     = params["fov_h"]
+        pa_deg    = params["pa_deg"]
+        delta_mag = params["delta_mag"]
+        max_err   = params["max_err"]
 
-        fov_w    = params["fov_w"]
-        fov_h    = params["fov_h"]
-        pa_deg   = params["pa_deg"]
-        catalog  = params["catalog"]
-        delta    = params["delta_mag"]
-        max_err  = params["max_err"]
+        v_vals = self._ephem["v"].dropna()
+        v_fallback = float(v_vals.mean()) if len(v_vals) > 0 else 15.0
         min_sep  = params["min_sep"]
         thr_good = params["thr_good"]
         thr_ok   = params["thr_ok"]
         thr_marg = params["thr_marg"]
 
+        # Pre-compute band-specific wide DataFrames (set mag/mag_err columns)
+        wide: dict[str, pd.DataFrame] = {}
+        for band in BANDS:
+            src = self._wide_ps if band in ("g", "i") else self._wide_2m
+            wide[band] = _band_view(src, band)
+
+        cache = []
         n = len(eph)
+
         for i, row in enumerate(eph.itertuples(index=False)):
             center = SkyCoord(ra=row.ra * u.deg, dec=row.dec * u.deg, frame="icrs")
             v_mag  = float(row.v) if not np.isnan(row.v) else None
 
-            if v_mag is not None:
-                mag_min = v_mag - delta
-                mag_max = v_mag + delta
-            else:
-                mag_min, mag_max = None, None
+            v = v_mag if v_mag is not None else v_fallback
 
-            if wide is None or wide.empty:
-                fov_df = pd.DataFrame(columns=wide.columns if wide is not None else [])
-            else:
-                fov_df = filter_rectangular_fov(wide, center, fov_w, fov_h, pa_deg)
+            bands_data: dict[str, dict] = {}
+            for band in BANDS:
+                wdf     = wide[band]
+                cat     = "panstarrs" if band in ("g", "i") else "2mass"
+                b_cen   = v + SOLAR_OFFSETS[band]
+                mag_min = b_cen - delta_mag
+                mag_max = b_cen + delta_mag
 
-            if not fov_df.empty:
-                fov_df = add_separation(fov_df, center)
-                filtered = apply_quality_filters(
-                    fov_df, catalog,
-                    mag_min if mag_min is not None else -99,
-                    mag_max if mag_max is not None else 99,
-                    max_err, min_sep)
-            else:
-                filtered = fov_df
+                if wdf.empty:
+                    fov_df   = pd.DataFrame()
+                    filtered = pd.DataFrame()
+                    summ     = {"n_usable": 0, "assessment": "BAD",
+                                "n_fov": 0, "n_rejected_near_asteroid": 0,
+                                "reject_counts": {}}
+                else:
+                    fov_df = filter_rectangular_fov(wdf, center, fov_w, fov_h, pa_deg)
+                    if not fov_df.empty:
+                        fov_df   = add_separation(fov_df, center)
+                        filtered = apply_quality_filters(
+                            fov_df, cat, mag_min, mag_max, max_err, min_sep)
+                    else:
+                        filtered = fov_df
+                    n_raw = len(fov_df)
+                    summ  = summarize(filtered, n_raw, n_raw,
+                                      thr_good, thr_ok, thr_marg)
 
-            n_raw = len(fov_df)
-            n_fov = len(fov_df)
-            summ  = summarize(filtered, n_raw, n_fov, thr_good, thr_ok, thr_marg)
+                bands_data[band] = {
+                    "df":         filtered,
+                    "summary":    summ,
+                    "n_usable":   summ.get("n_usable", 0),
+                    "assessment": summ.get("assessment", "BAD"),
+                }
 
             cache.append({
-                "time":       row.time_label,
-                "ra":         row.ra,
-                "dec":        row.dec,
-                "v_mag":      v_mag,
-                "df":         filtered,
-                "summary":    summ,
-                "n_usable":   summ.get("n_usable", 0),
-                "assessment": summ.get("assessment", "BAD"),
+                "time":    row.time_label,
+                "ra":      row.ra,
+                "dec":     row.dec,
+                "v_mag":   v_mag,
+                "bands":   bands_data,
             })
 
             if (i + 1) % max(1, n // 20) == 0 or i == n - 1:
@@ -954,10 +1065,11 @@ class VariableModePanel(ttk.Frame):
 
     def _show_vmag_range(self, v_min: float, v_max: float) -> None:
         if np.isnan(v_min):
-            self.lbl_vmag_range.config(text="V 等級: なし (手動設定推奨)", foreground="#cc6600")
+            self.lbl_vmag_range.config(
+                text="小惑星 V 等級: なし", foreground="#cc6600")
         else:
             self.lbl_vmag_range.config(
-                text=f"V 等級範囲: {v_min:.1f} 〜 {v_max:.1f} mag",
+                text=f"小惑星 V 等級: {v_min:.1f} 〜 {v_max:.1f} mag (Horizons 取得値)",
                 foreground="#1a5580")
 
     def _finish_error(self, msg: str) -> None:
@@ -970,29 +1082,19 @@ class VariableModePanel(ttk.Frame):
         self.btn_run.config(state="normal", text="▶  計算")
         self.btn_save.config(state="normal")
         self.lbl_status.config(
-            text=f"完了 — {len(self._cache)} エポック計算済み", foreground="#1a7a1a")
+            text=f"完了 — {len(self._cache)} エポック × 5 バンド計算済み",
+            foreground="#1a7a1a")
 
         n = len(self._cache)
         if n == 0:
             return
 
-        # Update V mag display (last epoch as representative)
-        v_last = self._cache[-1]["v_mag"]
-        if v_last is not None:
-            self.ent_vmag.config(state="normal")
-            self.ent_vmag.delete(0, "end")
-            self.ent_vmag.insert(0, f"{v_last:.2f}")
-            self.ent_vmag.config(state="readonly")
-
-        # Configure slider
         self.slider.config(to=n - 1)
         self.slider.set(0)
         self.slider.state(["!disabled"])
 
-        # Draw time-series graph
         self._draw_time_graph()
 
-        # Show first epoch
         self._step_idx = 0
         self._update_epoch_view(0)
 
@@ -1010,7 +1112,7 @@ class VariableModePanel(ttk.Frame):
             return
         entry = self._cache[idx]
         self.lbl_cur_time.config(text=entry["time"])
-        self._draw_star_field(entry)
+        self._draw_star_fields(entry)
         self._update_summary(entry)
 
     def _update_cursor(self, idx: int) -> None:
@@ -1018,33 +1120,15 @@ class VariableModePanel(ttk.Frame):
             self._cursor_line.set_xdata([idx])
             self.canvas.draw_idle()
 
-    # ── Plots ─────────────────────────────────────────────────────────────────
-
-    def _draw_empty_plots(self) -> None:
-        """Initial placeholder for both subplots."""
-        fov_w, fov_h = self._get_fov()
-
-        self.ax_time.clear()
-        self.ax_time.text(0.5, 0.5, "計算後に参照星数グラフが表示されます",
-                          ha="center", va="center", transform=self.ax_time.transAxes,
-                          color="#888888", fontsize=9, style="italic")
-        self.ax_time.set_title("時刻別 参照星数", fontsize=10)
-
-        self._draw_star_field_empty(fov_w, fov_h)
-        pass  # constrained_layout handles spacing
-        self.canvas.draw()
-
     # ── Twilight helpers ─────────────────────────────────────────────────────
 
     def _sun_altitudes(self, time_labels: list[str]) -> "np.ndarray | None":
-        """Return sun altitude [deg] at each epoch, or None on failure."""
         try:
             import re
             from datetime import datetime
             from astropy.coordinates import get_sun, AltAz, EarthLocation
             from astropy.time import Time
             import astropy.units as u
-
             lat = float(self.var_lat.get())
             lon = float(self.var_lon.get())
             alt = float(self.var_alt.get())
@@ -1052,8 +1136,8 @@ class VariableModePanel(ttk.Frame):
 
             def _parse(s: str):
                 s = re.sub(r"^A\.D\.\s*", "", s.strip())
-                s = re.sub(r"\s+TDB.*$",  "", s)
-                s = re.sub(r"\.\d+$",      "", s)
+                s = re.sub(r"\s+TDB.*$", "", s)
+                s = re.sub(r"\.\d+$", "", s)
                 for fmt in ("%Y-%b-%d %H:%M:%S", "%Y-%b-%d %H:%M",
                             "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
                     try:
@@ -1065,7 +1149,6 @@ class VariableModePanel(ttk.Frame):
             dts = [_parse(t) for t in time_labels]
             if any(d is None for d in dts):
                 return None
-
             times = Time(dts)
             frame = AltAz(obstime=times, location=location)
             sun   = get_sun(times).transform_to(frame)
@@ -1074,8 +1157,7 @@ class VariableModePanel(ttk.Frame):
             return None
 
     @staticmethod
-    def _shade_daytime(ax, is_day: "np.ndarray") -> None:
-        """Shade contiguous daytime/twilight blocks on ax (x = integer index)."""
+    def _shade_daytime(ax: plt.Axes, is_day: "np.ndarray") -> None:
         n = len(is_day)
         in_day = False
         start  = 0
@@ -1094,181 +1176,199 @@ class VariableModePanel(ttk.Frame):
     # ── Time graph ───────────────────────────────────────────────────────────
 
     def _draw_time_graph(self) -> None:
-        """Draw the time-series n_usable graph with assessment bands."""
         cache = self._cache
         if not cache:
             return
 
-        n_list  = [e["n_usable"]   for e in cache]
-        a_list  = [e["assessment"] for e in cache]
-        x       = list(range(len(cache)))
-
         thr_good = self._get_float(self.var_thr_good, 30)
         thr_ok   = self._get_float(self.var_thr_ok,   10)
         thr_marg = self._get_float(self.var_thr_marg,  5)
+        x        = list(range(len(cache)))
 
         self.ax_time.clear()
 
-        # ── Nautical twilight shading (sun > −12°) ──────────────────────────
-        labels = [e["time"] for e in cache]
+        # Twilight shading
+        labels   = [e["time"] for e in cache]
         sun_alts = self._sun_altitudes(labels)
         if sun_alts is not None:
             self._shade_daytime(self.ax_time, sun_alts > -12)
 
-        # Shaded threshold bands
-        ymax = max(max(n_list) * 1.15, thr_good * 1.2, 5)
-        self.ax_time.axhspan(thr_good, ymax,       alpha=0.08, color="#1a9641", zorder=0)
-        self.ax_time.axhspan(thr_ok,   thr_good,   alpha=0.08, color="#78c679", zorder=0)
-        self.ax_time.axhspan(thr_marg, thr_ok,     alpha=0.08, color="#d9a800", zorder=0)
-        self.ax_time.axhspan(0,        thr_marg,   alpha=0.08, color="#d7191c", zorder=0)
+        # Threshold bands and lines
+        all_n = [e["bands"][b]["n_usable"] for e in cache for b in BANDS]
+        ymax  = max(max(all_n) * 1.15 if all_n else 1, thr_good * 1.2, 5)
+        self.ax_time.axhspan(thr_good, ymax,     alpha=0.07, color="#1a9641", zorder=0)
+        self.ax_time.axhspan(thr_ok,   thr_good, alpha=0.07, color="#78c679", zorder=0)
+        self.ax_time.axhspan(thr_marg, thr_ok,   alpha=0.07, color="#d9a800", zorder=0)
+        self.ax_time.axhspan(0,        thr_marg, alpha=0.07, color="#d7191c", zorder=0)
 
-        # Threshold lines
-        for y, lbl, color in [(thr_good, "GOOD",     "#1a9641"),
-                               (thr_ok,   "OK",       "#78c679"),
-                               (thr_marg, "MARGINAL", "#d9a800")]:
-            self.ax_time.axhline(y=y, color=color, linewidth=0.8,
+        for y, lbl, col in [(thr_good, "GOOD",     "#1a9641"),
+                             (thr_ok,   "OK",       "#78c679"),
+                             (thr_marg, "MARGINAL", "#d9a800")]:
+            self.ax_time.axhline(y=y, color=col, linewidth=0.8,
                                  linestyle="--", alpha=0.7, zorder=1)
             self.ax_time.text(len(x) - 0.5, y + 0.4, lbl,
-                              color=color, fontsize=7, va="bottom", ha="right")
+                              color=col, fontsize=7, va="bottom", ha="right")
 
-        # Plot n_usable as coloured segments
-        colors = [ASSESS_COLORS.get(a, "#888888") for a in a_list]
-        for i in range(len(x) - 1):
-            self.ax_time.plot([x[i], x[i+1]], [n_list[i], n_list[i+1]],
-                              color=colors[i], linewidth=1.5, zorder=3)
-        self.ax_time.scatter(x, n_list, c=colors, s=20, zorder=4)
+        # One line per band
+        for band in BANDS:
+            n_list = [e["bands"][band]["n_usable"] for e in cache]
+            self.ax_time.plot(x, n_list,
+                              color=BAND_COLORS[band],
+                              linestyle=BAND_LINESTYLE[band],
+                              linewidth=1.6, label=band, zorder=3)
 
-        # X-axis labels (show ~8 ticks)
+        self.ax_time.legend(loc="upper left", fontsize=8, ncol=5, framealpha=0.85)
+
+        # X-axis ticks
         step = max(1, len(x) // 8)
         self.ax_time.set_xticks(x[::step])
         self.ax_time.set_xticklabels(labels[::step], rotation=25, ha="right", fontsize=7)
-
         self.ax_time.set_xlim(-0.5, len(x) - 0.5)
         self.ax_time.set_ylim(0, ymax)
         self.ax_time.set_ylabel("使用可能参照星数", fontsize=9)
-        self.ax_time.set_title("時刻別 参照星数", fontsize=10)
+        self.ax_time.set_title("時刻別 参照星数  (g・i: PS1   J・H・Ks: 2MASS)", fontsize=10)
         self.ax_time.grid(True, alpha=0.2, linestyle=":")
 
-        # Vertical cursor at idx=0
         self._cursor_line = self.ax_time.axvline(
             x=0, color="#cc3300", linewidth=1.5, linestyle="-", alpha=0.7, zorder=5)
 
         self.canvas.draw()
 
-    def _draw_star_field(self, entry: dict) -> None:
-        """Redraw star-field subplot for a given epoch entry."""
-        fov_w, fov_h = self._get_fov()
-        df           = entry.get("df")
-        summary      = entry.get("summary", {})
+    # ── Star field panels ────────────────────────────────────────────────────
 
-        self.ax_field.clear()
+    def _draw_star_fields(self, entry: dict) -> None:
+        fov_w, fov_h = self._get_fov()
         half_w = fov_w / 2
         half_h = fov_h / 2
-        margin  = max(fov_w, fov_h) * 0.18
+        margin = max(fov_w, fov_h) * 0.18
 
-        rect = mpatches.Rectangle(
-            (-half_w, -half_h), fov_w, fov_h,
-            linewidth=1.6, edgecolor="#2255aa", facecolor="none",
-            linestyle="--", label="FoV")
-        self.ax_field.add_patch(rect)
+        for band, ax in self.ax_bands.items():
+            ax.clear()
+            bdata = entry["bands"][band]
+            df    = bdata["df"]
+            n_u   = bdata["n_usable"]
+            ass   = bdata["assessment"]
 
-        self.ax_field.scatter(
-            [0], [0], s=250, c="gold", marker="*",
-            zorder=6, label="Asteroid", edgecolors="#cc8800", linewidths=0.8)
+            rect = mpatches.Rectangle(
+                (-half_w, -half_h), fov_w, fov_h,
+                linewidth=1.2, edgecolor=BAND_COLORS[band],
+                facecolor="none", linestyle="--")
+            ax.add_patch(rect)
 
-        n_usable = 0
-        if df is not None and not df.empty and "x_arcmin" in df.columns:
-            usable   = df[df["usable"]]
-            rejected = df[~df["usable"]]
-            n_usable = len(usable)
+            ax.scatter([0], [0], s=120, c="gold", marker="*",
+                       zorder=6, edgecolors="#cc8800", linewidths=0.6)
 
-            if not usable.empty:
-                mags  = usable["mag"].fillna(15.0).clip(lower=8, upper=22)
-                sizes = np.clip(400 - mags * 16, 15, 400)
-                self.ax_field.scatter(
-                    usable["x_arcmin"], usable["y_arcmin"],
-                    s=sizes, c="deepskyblue", marker="o", alpha=0.85,
-                    zorder=5, label=f"Usable ({n_usable})",
-                    edgecolors="steelblue", linewidths=0.6)
+            if df is not None and not df.empty and "x_arcmin" in df.columns:
+                usable   = df[df["usable"]]
+                rejected = df[~df["usable"]]
 
-            if not rejected.empty:
-                self.ax_field.scatter(
-                    rejected["x_arcmin"], rejected["y_arcmin"],
-                    s=35, c="tomato", marker="x", alpha=0.7,
-                    zorder=4, label=f"Rejected ({len(rejected)})",
-                    linewidths=1.2)
+                if not usable.empty:
+                    mags  = usable["mag"].fillna(15.0).clip(lower=8, upper=22)
+                    sizes = np.clip(200 - mags * 8, 8, 200)
+                    ax.scatter(usable["x_arcmin"], usable["y_arcmin"],
+                               s=sizes, c=BAND_COLORS[band], alpha=0.75,
+                               zorder=5, edgecolors="none")
 
-        self.ax_field.set_xlim(half_w + margin, -half_w - margin)
-        self.ax_field.set_ylim(-half_h - margin, half_h + margin)
-        self.ax_field.set_aspect("equal", adjustable="box")
-        self.ax_field.set_xlabel("ΔRA  [arcmin]  (East →←)", fontsize=9)
-        self.ax_field.set_ylabel("ΔDec  [arcmin]", fontsize=9)
+                if not rejected.empty:
+                    ax.scatter(rejected["x_arcmin"], rejected["y_arcmin"],
+                               s=18, c="tomato", marker="x", alpha=0.6,
+                               zorder=4, linewidths=0.8)
 
-        assessment = summary.get("assessment", "")
-        color = ASSESS_COLORS.get(assessment, "black")
-        v_str = f"  V={entry['v_mag']:.1f}" if entry.get("v_mag") is not None else ""
-        self.ax_field.set_title(
-            f"[{assessment}]  {n_usable} usable{v_str}",
-            fontsize=10, color=color, fontweight="bold")
+            ax.set_xlim( half_w + margin, -half_w - margin)
+            ax.set_ylim(-half_h - margin,  half_h + margin)
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlabel("ΔRA [']", fontsize=7)
+            if band == "g":
+                ax.set_ylabel("ΔDec [']", fontsize=7)
+            ax.tick_params(labelsize=6)
 
-        self.ax_field.legend(loc="upper right", fontsize=8, framealpha=0.8)
-        self.ax_field.grid(True, alpha=0.25, linestyle=":")
+            color = ASSESS_COLORS.get(ass, "black")
+            ax.set_title(f"{band}   {n_u}★  [{ass}]",
+                         fontsize=8, color=color, fontweight="bold")
+            ax.grid(True, alpha=0.2, linestyle=":")
 
-        pass  # constrained_layout handles spacing
         self.canvas.draw()
 
-    def _draw_star_field_empty(self, fov_w: float, fov_h: float) -> None:
-        self.ax_field.clear()
+    def _draw_star_fields_empty(self) -> None:
+        fov_w, fov_h = self._get_fov()
         half_w = fov_w / 2
         half_h = fov_h / 2
-        margin  = max(fov_w, fov_h) * 0.18
+        margin = max(fov_w, fov_h) * 0.18
 
-        rect = mpatches.Rectangle(
-            (-half_w, -half_h), fov_w, fov_h,
-            linewidth=1.6, edgecolor="#2255aa", facecolor="none",
-            linestyle="--")
-        self.ax_field.add_patch(rect)
-        self.ax_field.text(0, 0, "計算後に星図が表示されます",
-                           ha="center", va="center", color="#888888",
-                           fontsize=10, style="italic")
-        self.ax_field.set_xlim(half_w + margin, -half_w - margin)
-        self.ax_field.set_ylim(-half_h - margin, half_h + margin)
-        self.ax_field.set_aspect("equal", adjustable="box")
-        self.ax_field.set_xlabel("ΔRA  [arcmin]  (East →←)", fontsize=9)
-        self.ax_field.set_ylabel("ΔDec  [arcmin]", fontsize=9)
-        self.ax_field.set_title("Star Field Preview", fontsize=10)
-        self.ax_field.grid(True, alpha=0.25, linestyle=":")
+        for band, ax in self.ax_bands.items():
+            ax.clear()
+            rect = mpatches.Rectangle(
+                (-half_w, -half_h), fov_w, fov_h,
+                linewidth=1.2, edgecolor=BAND_COLORS[band], facecolor="none",
+                linestyle="--")
+            ax.add_patch(rect)
+            if band == "g":
+                ax.text(0, 0, "計算後に表示", ha="center", va="center",
+                        color="#888888", fontsize=8, style="italic")
+            ax.set_xlim( half_w + margin, -half_w - margin)
+            ax.set_ylim(-half_h - margin,  half_h + margin)
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlabel("ΔRA [']", fontsize=7)
+            if band == "g":
+                ax.set_ylabel("ΔDec [']", fontsize=7)
+            ax.tick_params(labelsize=6)
+            ax.set_title(band, fontsize=8, color=BAND_COLORS[band])
+            ax.grid(True, alpha=0.2, linestyle=":")
+
+    def _draw_empty_plots(self) -> None:
+        self.ax_time.clear()
+        self.ax_time.text(0.5, 0.5, "計算後に参照星数グラフが表示されます",
+                          ha="center", va="center", transform=self.ax_time.transAxes,
+                          color="#888888", fontsize=9, style="italic")
+        self.ax_time.set_title(
+            "時刻別 参照星数  (g・i: PS1   J・H・Ks: 2MASS)", fontsize=10)
+        self._draw_star_fields_empty()
+        self.canvas.draw()
 
     # ── Summary ───────────────────────────────────────────────────────────────
 
     def _update_summary(self, entry: dict) -> None:
-        summ       = entry.get("summary", {})
-        assessment = summ.get("assessment", "?")
-        n_usable   = summ.get("n_usable", 0)
-        reject_counts = summ.get("reject_counts", {})
-
         time_str = entry.get("time", "")
-        v_str    = f"  小惑星V: {entry['v_mag']:.2f}" if entry.get("v_mag") else ""
+        v_str    = (f"  V={entry['v_mag']:.2f}" if entry.get("v_mag") is not None else "")
+        ra       = entry.get("ra")
+        dec      = entry.get("dec")
+        radec    = (f"  RA={ra:.4f}°  Dec={dec:+.4f}°"
+                    if ra is not None and dec is not None else "")
 
-        ra  = entry.get("ra")
-        dec = entry.get("dec")
-        radec_str = (f"  RA={ra:.4f}°  Dec={dec:+.4f}°" if ra is not None and dec is not None else "")
+        band_parts = []
+        for band in BANDS:
+            bd  = entry["bands"][band]
+            ass = bd["assessment"]
+            col_marker = {"GOOD": "◎", "OK": "○", "MARGINAL": "△",
+                          "POOR": "▲", "BAD": "✕"}.get(ass, "?")
+            band_parts.append(f"{band}: {bd['n_usable']}★ {col_marker}[{ass}]")
 
         parts = [
             f"時刻: {time_str}{v_str}",
-            f"座標:{radec_str}",
-            f"FoV 内: {summ.get('n_fov', 0)}",
-            f"近傍除外: {summ.get('n_rejected_near_asteroid', 0)}",
-            f"使用可能: {n_usable} 星",
-            f"判定: {assessment}",
+            f"座標:{radec}",
+            "   ".join(band_parts),
         ]
-        if reject_counts:
-            detail = "  ".join(
-                f"{r}: {c}"
-                for r, c in sorted(reject_counts.items(), key=lambda x: -x[1]))
-            parts.append(f"除外理由 → {detail}")
 
-        color = ASSESS_COLORS.get(assessment, "#000000")
+        # Best assessment across optical bands
+        best = max(
+            (entry["bands"][b]["n_usable"] for b in ("g", "i")),
+            default=0
+        )
+        thr_good = self._get_float(self.var_thr_good, 30)
+        thr_ok   = self._get_float(self.var_thr_ok,   10)
+        thr_marg = self._get_float(self.var_thr_marg,  5)
+        if best >= thr_good:
+            overall = "GOOD"
+        elif best >= thr_ok:
+            overall = "OK"
+        elif best >= thr_marg:
+            overall = "MARGINAL"
+        elif best >= 1:
+            overall = "POOR"
+        else:
+            overall = "BAD"
+
+        color = ASSESS_COLORS.get(overall, "#000000")
         self.lbl_summary.config(text="     ".join(parts), foreground=color)
 
     # ── Save ─────────────────────────────────────────────────────────────────
@@ -1288,22 +1388,25 @@ class VariableModePanel(ttk.Frame):
 
         rows = []
         for entry in self._cache:
-            df = entry.get("df")
-            if df is None or df.empty:
-                continue
-            df = df.copy()
-            df["time"]   = entry["time"]
-            df["v_mag"]  = entry["v_mag"]
-            df["assessment"] = entry["assessment"]
-            for col in OUTPUT_COLUMNS:
-                if col not in df.columns:
-                    df[col] = ""
-            rows.append(df)
+            for band in BANDS:
+                bd = entry["bands"][band]
+                df = bd.get("df")
+                if df is None or df.empty:
+                    continue
+                df = df.copy()
+                df["time"]       = entry["time"]
+                df["v_mag"]      = entry.get("v_mag")
+                df["band"]       = band
+                df["assessment"] = bd["assessment"]
+                for col in OUTPUT_COLUMNS:
+                    if col not in df.columns:
+                        df[col] = ""
+                rows.append(df)
 
         if rows:
             out = pd.concat(rows, ignore_index=True)
         else:
-            out = pd.DataFrame(columns=OUTPUT_COLUMNS)
+            out = pd.DataFrame(columns=OUTPUT_COLUMNS + ["band"])
 
         out.to_csv(path, index=False)
         self.lbl_status.config(text=f"保存: {path}", foreground="#0055cc")
