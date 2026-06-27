@@ -293,8 +293,9 @@ class VariableModePanel(ttk.Frame):
         self._running   = False
         self._ephem: Optional[pd.DataFrame] = None
         self._cache: list[dict] = []
-        self._wide_ps: Optional[pd.DataFrame] = None   # Pan-STARRS wide query
-        self._wide_2m: Optional[pd.DataFrame] = None   # 2MASS wide query
+        self._display_indices: list[int] = []          # filtered view into _cache
+        self._wide_ps: Optional[pd.DataFrame] = None
+        self._wide_2m: Optional[pd.DataFrame] = None
         self._cursor_line = None
         self._step_idx    = 0
 
@@ -314,7 +315,9 @@ class VariableModePanel(ttk.Frame):
         self.var_h_arcmin   = tk.StringVar(value="6")
         self.var_h_arcsec   = tk.StringVar(value="6")
         self.var_pa         = tk.StringVar(value="0")
-        self.var_delta_mag  = tk.StringVar(value="3.0")
+        self.var_delta_mag    = tk.StringVar(value="3.0")
+        self.var_filter_start = tk.StringVar()
+        self.var_filter_end   = tk.StringVar()
         self.var_mag_err    = tk.StringVar(value="0.05")
         self.var_min_sep    = tk.StringVar(value="5")
         self.var_thr_good   = tk.StringVar(value="30")
@@ -608,31 +611,62 @@ class VariableModePanel(ttk.Frame):
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew", rowspan=3)
 
-        # Time slider
+        # ── Time slider + navigation ─────────────────────────────────────────
         slider_frame = ttk.Frame(right)
         slider_frame.grid(row=3, column=0, sticky="ew", pady=(4, 0))
-        slider_frame.columnconfigure(1, weight=1)
+        slider_frame.columnconfigure(2, weight=1)
 
-        ttk.Label(slider_frame, text="時刻:").grid(row=0, column=0, padx=(0, 6))
+        self.btn_prev = ttk.Button(slider_frame, text="◀", width=3,
+                                   command=self._on_prev, state="disabled")
+        self.btn_prev.grid(row=0, column=0, padx=(0, 4))
+
+        self.btn_next = ttk.Button(slider_frame, text="▶", width=3,
+                                   command=self._on_next, state="disabled")
+        self.btn_next.grid(row=0, column=1, padx=(0, 8))
+
         self.lbl_cur_time = ttk.Label(
             slider_frame, text="—", font=("", 9), foreground="#333")
-        self.lbl_cur_time.grid(row=0, column=1, sticky="w")
+        self.lbl_cur_time.grid(row=0, column=2, sticky="w")
+
+        ttk.Label(slider_frame, text="← → キーでも移動可",
+                  foreground="#999", font=("", 8)).grid(
+            row=0, column=3, sticky="e", padx=(8, 0))
 
         self.slider = ttk.Scale(
             slider_frame, from_=0, to=1, orient="horizontal",
             command=self._on_slider)
-        self.slider.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        self.slider.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(2, 0))
         self.slider.state(["disabled"])
+
+        # ── Display filter ───────────────────────────────────────────────────
+        ffilter = ttk.LabelFrame(right, text="🔍 表示期間フィルタ", padding=(6, 4))
+        ffilter.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        ffilter.columnconfigure(1, weight=1)
+        ffilter.columnconfigure(3, weight=1)
+
+        ttk.Label(ffilter, text="開始").grid(row=0, column=0, padx=(0, 4))
+        ttk.Entry(ffilter, textvariable=self.var_filter_start,
+                  width=16).grid(row=0, column=1, sticky="ew")
+        ttk.Label(ffilter, text="〜  終了").grid(row=0, column=2, padx=(8, 4))
+        ttk.Entry(ffilter, textvariable=self.var_filter_end,
+                  width=16).grid(row=0, column=3, sticky="ew")
+        ttk.Button(ffilter, text="適用", width=5,
+                   command=self._on_filter_apply).grid(row=0, column=4, padx=(8, 0))
+        ttk.Button(ffilter, text="リセット", width=7,
+                   command=self._on_filter_reset).grid(row=0, column=5, padx=(4, 0))
+        ttk.Label(ffilter, text="形式: YYYY-MM-DD HH:MM (空欄=制限なし)",
+                  foreground="#999", font=("", 8)).grid(
+            row=1, column=0, columnspan=6, sticky="w", pady=(2, 0))
 
         # Navigation toolbar
         toolbar_frame = ttk.Frame(right)
-        toolbar_frame.grid(row=4, column=0, sticky="ew")
+        toolbar_frame.grid(row=5, column=0, sticky="ew")
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
 
         # Summary
         fsum = ttk.LabelFrame(right, text="📈 サマリ (現在のエポック)", padding=8)
-        fsum.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        fsum.grid(row=6, column=0, sticky="ew", pady=(8, 0))
         fsum.columnconfigure(0, weight=1)
         self.lbl_summary = ttk.Label(
             fsum, text="— まだ計算していません —",
@@ -640,6 +674,17 @@ class VariableModePanel(ttk.Frame):
         self.lbl_summary.grid(row=0, column=0, sticky="w")
 
         self._draw_empty_plots()
+
+        # Arrow key navigation (skip if focus is on a text-input widget)
+        def _on_key(event):
+            if isinstance(self.focus_get(), (ttk.Entry, tk.Entry, ttk.Combobox)):
+                return
+            if event.keysym == "Left":
+                self._on_prev()
+            elif event.keysym == "Right":
+                self._on_next()
+        self.bind_all("<Left>",  _on_key, add="+")
+        self.bind_all("<Right>", _on_key, add="+")
 
     # ── Observatory search ────────────────────────────────────────────────────
 
@@ -1089,28 +1134,53 @@ class VariableModePanel(ttk.Frame):
         if n == 0:
             return
 
+        self._display_indices = list(range(n))
+        self.var_filter_start.set("")
+        self.var_filter_end.set("")
+        self._step_idx = 0
+
         self.slider.config(to=n - 1)
         self.slider.set(0)
         self.slider.state(["!disabled"])
+        self.btn_prev.config(state="normal")
+        self.btn_next.config(state="normal")
 
         self._draw_time_graph()
-
-        self._step_idx = 0
         self._update_epoch_view(0)
 
     # ── Time slider ───────────────────────────────────────────────────────────
 
     def _on_slider(self, value: str) -> None:
         idx = int(float(value))
-        if idx != self._step_idx and self._cache:
+        if idx != self._step_idx and self._display_indices:
             self._step_idx = idx
             self._update_cursor(idx)
             self._update_epoch_view(idx)
 
-    def _update_epoch_view(self, idx: int) -> None:
-        if not self._cache or idx >= len(self._cache):
+    def _on_prev(self, _event=None) -> None:
+        if not self._display_indices:
             return
-        entry = self._cache[idx]
+        new_idx = max(0, self._step_idx - 1)
+        if new_idx != self._step_idx:
+            self._step_idx = new_idx
+            self.slider.set(new_idx)
+            self._update_cursor(new_idx)
+            self._update_epoch_view(new_idx)
+
+    def _on_next(self, _event=None) -> None:
+        if not self._display_indices:
+            return
+        new_idx = min(len(self._display_indices) - 1, self._step_idx + 1)
+        if new_idx != self._step_idx:
+            self._step_idx = new_idx
+            self.slider.set(new_idx)
+            self._update_cursor(new_idx)
+            self._update_epoch_view(new_idx)
+
+    def _update_epoch_view(self, idx: int) -> None:
+        if not self._display_indices or idx >= len(self._display_indices):
+            return
+        entry = self._cache[self._display_indices[idx]]
         self.lbl_cur_time.config(text=entry["time"])
         self._draw_star_fields(entry)
         self._update_summary(entry)
@@ -1119,6 +1189,73 @@ class VariableModePanel(ttk.Frame):
         if self._cursor_line is not None:
             self._cursor_line.set_xdata([idx])
             self.canvas.draw_idle()
+
+    # ── Filter helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_epoch_dt(time_label: str) -> "Optional[datetime.datetime]":
+        """Parse a Horizons time label string to a datetime for filtering."""
+        import re
+        s = re.sub(r"^A\.D\.\s*", "", time_label.strip())
+        s = re.sub(r"\s+TDB.*$", "", s)
+        s = re.sub(r"\.\d+$", "", s)
+        for fmt in ("%Y-%b-%d %H:%M:%S", "%Y-%b-%d %H:%M",
+                    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.datetime.strptime(s, fmt)
+            except ValueError:
+                pass
+        return None
+
+    def _on_filter_apply(self) -> None:
+        if not self._cache:
+            return
+        start_str = self.var_filter_start.get().strip()
+        end_str   = self.var_filter_end.get().strip()
+        try:
+            start_dt = (datetime.datetime.strptime(start_str, "%Y-%m-%d %H:%M")
+                        if start_str else None)
+            end_dt   = (datetime.datetime.strptime(end_str,   "%Y-%m-%d %H:%M")
+                        if end_str else None)
+        except ValueError:
+            messagebox.showwarning("フィルタエラー", "日時形式: YYYY-MM-DD HH:MM")
+            return
+
+        indices = []
+        for i, entry in enumerate(self._cache):
+            dt = self._parse_epoch_dt(entry["time"])
+            if dt is None:
+                indices.append(i)
+                continue
+            if start_dt and dt < start_dt:
+                continue
+            if end_dt and dt > end_dt:
+                continue
+            indices.append(i)
+
+        if not indices:
+            messagebox.showinfo("フィルタ", "該当するエポックがありません。\nフィルタをリセットします。")
+            self._on_filter_reset()
+            return
+
+        self._display_indices = indices
+        self._step_idx = 0
+        self.slider.config(to=max(0, len(indices) - 1))
+        self.slider.set(0)
+        self._draw_time_graph()
+        self._update_epoch_view(0)
+
+    def _on_filter_reset(self) -> None:
+        if not self._cache:
+            return
+        self._display_indices = list(range(len(self._cache)))
+        self.var_filter_start.set("")
+        self.var_filter_end.set("")
+        self._step_idx = 0
+        self.slider.config(to=max(0, len(self._cache) - 1))
+        self.slider.set(0)
+        self._draw_time_graph()
+        self._update_epoch_view(0)
 
     # ── Twilight helpers ─────────────────────────────────────────────────────
 
@@ -1176,9 +1313,9 @@ class VariableModePanel(ttk.Frame):
     # ── Time graph ───────────────────────────────────────────────────────────
 
     def _draw_time_graph(self) -> None:
-        cache = self._cache
-        if not cache:
+        if not self._display_indices:
             return
+        cache = [self._cache[i] for i in self._display_indices]
 
         thr_good = self._get_float(self.var_thr_good, 30)
         thr_ok   = self._get_float(self.var_thr_ok,   10)

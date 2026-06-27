@@ -60,6 +60,7 @@ TELESCOPE_PRESETS: list[tuple[str, Optional[tuple[float, float]]]] = [
     ("Keck 10m / DEIMOS",             (16.7, 5.0)),
     ("VLT 8.2m / FORS2",              (6.8,  6.8)),
     ("Gemini 8.1m / GMOS",            (5.5,  5.5)),
+    ("ksirius",                        (3.7, 2.9)),
     ("Custom",                         None),
 ]
 
