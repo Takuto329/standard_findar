@@ -676,10 +676,14 @@ class VariableModePanel(ttk.Frame):
         fsum = ttk.LabelFrame(right, text="📈 サマリ (現在のエポック)", padding=8)
         fsum.grid(row=6, column=0, sticky="ew", pady=(8, 0))
         fsum.columnconfigure(0, weight=1)
-        self.lbl_summary = ttk.Label(
-            fsum, text="— まだ計算していません —",
-            font=("", 10), wraplength=900, justify="left")
-        self.lbl_summary.grid(row=0, column=0, sticky="w")
+        self.txt_summary = tk.Text(
+            fsum, height=4, font=("Menlo", 10), relief="flat",
+            background=fsum.cget("background") if hasattr(fsum, "cget") else "#f0f0f0",
+            state="disabled", cursor="arrow", wrap="word",
+            borderwidth=0)
+        self.txt_summary.grid(row=0, column=0, sticky="ew")
+        self.txt_summary.tag_configure("colored", foreground="#333333")
+        self.txt_summary.tag_configure("hint", foreground="#aaaaaa")
 
         self._draw_empty_plots()
 
@@ -1508,15 +1512,28 @@ class VariableModePanel(ttk.Frame):
             "時刻別 参照星数  (g・i: PS1   J・H・Ks: 2MASS)", fontsize=10)
         self._draw_star_fields_empty()
         self.canvas.draw()
+        self.txt_summary.config(state="normal")
+        self.txt_summary.delete("1.0", "end")
+        self.txt_summary.insert("1.0", "— まだ計算していません —", "hint")
+        self.txt_summary.config(state="disabled")
 
     # ── Summary ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _fmt_radec(ra_deg: float, dec_deg: float) -> str:
+        from astropy.coordinates import Angle
+        import astropy.units as u
+        ra_str  = Angle(ra_deg  * u.deg).to_string(unit=u.hour, sep=":", precision=2, pad=True)
+        dec_str = Angle(dec_deg * u.deg).to_string(unit=u.deg,  sep=":", precision=1,
+                                                    alwayssign=True, pad=True)
+        return f"RA {ra_str}  Dec {dec_str}"
+
     def _update_summary(self, entry: dict) -> None:
-        time_str = entry.get("time", "")
+        time_str = self._fmt_label(entry.get("time", ""))
         v_str    = (f"  V={entry['v_mag']:.2f}" if entry.get("v_mag") is not None else "")
         ra       = entry.get("ra")
         dec      = entry.get("dec")
-        radec    = (f"  RA={ra:.4f}°  Dec={dec:+.4f}°"
+        radec    = ("  " + self._fmt_radec(ra, dec)
                     if ra is not None and dec is not None else "")
 
         band_parts = []
@@ -1527,11 +1544,12 @@ class VariableModePanel(ttk.Frame):
                           "POOR": "▲", "BAD": "✕"}.get(ass, "?")
             band_parts.append(f"{band}: {bd['n_usable']}★ {col_marker}[{ass}]")
 
-        parts = [
+        lines = [
             f"時刻: {time_str}{v_str}",
             f"座標:{radec}",
             "   ".join(band_parts),
         ]
+        text = "\n".join(lines)
 
         # Best assessment across optical bands
         best = max(
@@ -1553,7 +1571,11 @@ class VariableModePanel(ttk.Frame):
             overall = "BAD"
 
         color = ASSESS_COLORS.get(overall, "#000000")
-        self.lbl_summary.config(text="     ".join(parts), foreground=color)
+        self.txt_summary.tag_configure("colored", foreground=color)
+        self.txt_summary.config(state="normal")
+        self.txt_summary.delete("1.0", "end")
+        self.txt_summary.insert("1.0", text, "colored")
+        self.txt_summary.config(state="disabled")
 
     # ── Save ─────────────────────────────────────────────────────────────────
 
