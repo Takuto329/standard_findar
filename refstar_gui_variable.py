@@ -318,6 +318,7 @@ class VariableModePanel(ttk.Frame):
         self.var_delta_mag    = tk.StringVar(value="3.0")
         self.var_filter_start = tk.StringVar()
         self.var_filter_end   = tk.StringVar()
+        self.var_tz_jst       = tk.BooleanVar(value=False)
         self.var_mag_err    = tk.StringVar(value="0.05")
         self.var_min_sep    = tk.StringVar(value="5")
         self.var_thr_good   = tk.StringVar(value="30")
@@ -449,7 +450,14 @@ class VariableModePanel(ttk.Frame):
             row=0, column=1, padx=(4, 0))
 
         # ── 観測期間 ─────────────────────────────────────────────────────────
-        ftime = ttk.LabelFrame(left, text="⏱ 観測期間 (UTC)", padding=8)
+        _ftime_lbl = ttk.Frame(left)
+        ttk.Label(_ftime_lbl, text="⏱ 観測期間").pack(side="left")
+        ttk.Checkbutton(
+            _ftime_lbl, text="JST", variable=self.var_tz_jst,
+            command=self._on_tz_toggle,
+        ).pack(side="left", padx=(6, 0))
+        self.ftime = ttk.LabelFrame(left, labelwidget=_ftime_lbl, padding=8)
+        ftime = self.ftime
         ftime.grid(row=r, column=0, sticky="ew", pady=(0, 8)); r += 1
         ftime.columnconfigure(1, weight=1)
 
@@ -886,6 +894,8 @@ class VariableModePanel(ttk.Frame):
         except ValueError:
             messagebox.showwarning("入力エラー", "日時形式が不正です。\n形式: YYYY-MM-DD HH:MM")
             return
+        start = self._input_to_utc(start)
+        end   = self._input_to_utc(end)
 
         step = self.var_step_val.get().strip() + self.var_step_unit.get().strip()
 
@@ -1181,7 +1191,7 @@ class VariableModePanel(ttk.Frame):
         if not self._display_indices or idx >= len(self._display_indices):
             return
         entry = self._cache[self._display_indices[idx]]
-        self.lbl_cur_time.config(text=entry["time"])
+        self.lbl_cur_time.config(text=self._fmt_label(entry["time"]))
         self._draw_star_fields(entry)
         self._update_summary(entry)
 
@@ -1189,6 +1199,42 @@ class VariableModePanel(ttk.Frame):
         if self._cursor_line is not None:
             self._cursor_line.set_xdata([idx])
             self.canvas.draw_idle()
+
+    # ── Timezone helpers ──────────────────────────────────────────────────────
+
+    _JST_OFFSET = datetime.timedelta(hours=9)
+
+    def _input_to_utc(self, val: str) -> str:
+        """Convert an input time string to UTC. Subtracts 9h when JST mode is on."""
+        if not self.var_tz_jst.get():
+            return val
+        dt = datetime.datetime.strptime(val.strip(), "%Y-%m-%d %H:%M")
+        return (dt - self._JST_OFFSET).strftime("%Y-%m-%d %H:%M")
+
+    def _fmt_label(self, time_label: str) -> str:
+        """Return time_label converted to JST if the toggle is on, else as-is."""
+        if not self.var_tz_jst.get():
+            return time_label
+        dt = self._parse_epoch_dt(time_label)
+        if dt is None:
+            return time_label
+        dt_jst = dt + self._JST_OFFSET
+        return dt_jst.strftime("%Y-%b-%d %H:%M JST")
+
+    def _on_tz_toggle(self) -> None:
+        jst_on = self.var_tz_jst.get()
+        delta = self._JST_OFFSET if jst_on else -self._JST_OFFSET
+        for var in (self.var_start, self.var_end):
+            val = var.get().strip()
+            try:
+                dt = datetime.datetime.strptime(val, "%Y-%m-%d %H:%M")
+                var.set((dt + delta).strftime("%Y-%m-%d %H:%M"))
+            except ValueError:
+                pass
+        if self._cache:
+            self._draw_time_graph()
+            if self._display_indices:
+                self._update_epoch_view(self._step_idx)
 
     # ── Filter helpers ────────────────────────────────────────────────────────
 
@@ -1286,7 +1332,7 @@ class VariableModePanel(ttk.Frame):
             dts = [_parse(t) for t in time_labels]
             if any(d is None for d in dts):
                 return None
-            times = Time(dts)
+            times = Time(dts, format='datetime', scale='utc')
             frame = AltAz(obstime=times, location=location)
             sun   = get_sun(times).transform_to(frame)
             return sun.alt.deg
@@ -1328,7 +1374,7 @@ class VariableModePanel(ttk.Frame):
         labels   = [e["time"] for e in cache]
         sun_alts = self._sun_altitudes(labels)
         if sun_alts is not None:
-            self._shade_daytime(self.ax_time, sun_alts > -12)
+            self._shade_daytime(self.ax_time, sun_alts > -18)
 
         # Threshold bands and lines
         all_n = [e["bands"][b]["n_usable"] for e in cache for b in BANDS]
@@ -1358,8 +1404,9 @@ class VariableModePanel(ttk.Frame):
 
         # X-axis ticks
         step = max(1, len(x) // 8)
+        display_labels = [self._fmt_label(lb) for lb in labels]
         self.ax_time.set_xticks(x[::step])
-        self.ax_time.set_xticklabels(labels[::step], rotation=25, ha="right", fontsize=7)
+        self.ax_time.set_xticklabels(display_labels[::step], rotation=25, ha="right", fontsize=7)
         self.ax_time.set_xlim(-0.5, len(x) - 0.5)
         self.ax_time.set_ylim(0, ymax)
         self.ax_time.set_ylabel("使用可能参照星数", fontsize=9)
