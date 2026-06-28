@@ -415,7 +415,7 @@ class FixedModePanel(ttk.Frame):
         if self._all_df is not None:
             circ = plt.Circle((0, 0), R, fill=False, linestyle=":",
                                edgecolor="#999999", linewidth=1.2, alpha=0.7,
-                               label=f"検索円 (R={R:.1f}′)", zorder=1)
+                               label=f"FoV移動範囲 (R={R:.1f}′)", zorder=1)
             self.ax.add_patch(circ)
 
         # FoV rectangle (at current offset)
@@ -707,7 +707,9 @@ class FixedModePanel(ttk.Frame):
         thr_ok   = params["thr_ok"]
         thr_marg = params["thr_marg"]
 
-        radius = circumscribed_radius(fov_w, fov_h)
+        # Query the full diagonal so stars remain in coverage when FoV is shifted
+        # to place the target at the corner (max FoV-corner distance = 2 × R_circ).
+        radius = 2 * circumscribed_radius(fov_w, fov_h)
 
         try:
             if catalog == "simbad":
