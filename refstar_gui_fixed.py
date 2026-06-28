@@ -503,7 +503,8 @@ class FixedModePanel(ttk.Frame):
                          transform=self.ax.transAxes, fontsize=8,
                          color="#666666", va="bottom")
 
-        self.ax.legend(loc="upper right", fontsize=9, framealpha=0.8)
+        self.ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13),
+                       ncol=3, fontsize=9, framealpha=0.9)
         self.ax.grid(True, alpha=0.25, linestyle=":")
         self.fig.tight_layout(pad=2.0)
         self.canvas.draw_idle()
