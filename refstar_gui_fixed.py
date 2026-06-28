@@ -819,17 +819,26 @@ class FixedModePanel(ttk.Frame):
             self._drag_fov_x0   = cx
             self._drag_fov_y0   = cy
 
+    @staticmethod
+    def _clamp_fov_center(cx: float, cy: float,
+                          half_w: float, half_h: float, R: float) -> tuple[float, float]:
+        """Clamp (cx, cy) so target stays in FoV and centre stays within coverage circle."""
+        cx = float(np.clip(cx, -half_w, half_w))
+        cy = float(np.clip(cy, -half_h, half_h))
+        dist = np.hypot(cx, cy)
+        if dist > R:
+            cx *= R / dist
+            cy *= R / dist
+        return cx, cy
+
     def _on_drag_motion(self, event) -> None:
         if not self._dragging or event.inaxes != self.ax or event.xdata is None:
             return
         fov_w, fov_h = self._get_fov()
         R = circumscribed_radius(fov_w, fov_h)
-        new_cx = self._drag_fov_x0 + (event.xdata - self._drag_anchor_x)
-        new_cy = self._drag_fov_y0 + (event.ydata - self._drag_anchor_y)
-        dist = np.hypot(new_cx, new_cy)
-        if dist > R:
-            new_cx *= R / dist
-            new_cy *= R / dist
+        raw_cx = self._drag_fov_x0 + (event.xdata - self._drag_anchor_x)
+        raw_cy = self._drag_fov_y0 + (event.ydata - self._drag_anchor_y)
+        new_cx, new_cy = self._clamp_fov_center(raw_cx, raw_cy, fov_w / 2, fov_h / 2, R)
         self._fov_cx = new_cx
         self._fov_cy = new_cy
         filtered = self._filter_at_offset(new_cx, new_cy)
@@ -875,6 +884,9 @@ class FixedModePanel(ttk.Frame):
 
         for cx in xs:
             for cy in ys:
+                # target must stay in FoV AND centre within coverage circle
+                if abs(cx) > half_w or abs(cy) > half_h:
+                    continue
                 if cx ** 2 + cy ** 2 > R ** 2:
                     continue
                 inside = ((df["x_arcmin"] - cx).abs() <= half_w) & \
