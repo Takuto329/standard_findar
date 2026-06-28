@@ -93,6 +93,19 @@ class FixedModePanel(ttk.Frame):
         self._summary:   Optional[dict] = None
         self._running    = False
 
+        # FoV drag / optimize state
+        self._all_df: Optional[pd.DataFrame] = None  # all stars in search circle, annotated
+        self._query_center  = None   # SkyCoord of target
+        self._query_params: Optional[dict] = None
+        self._fov_cx = 0.0  # FoV centre x-offset from target (arcmin, rotated frame)
+        self._fov_cy = 0.0  # FoV centre y-offset from target (arcmin, rotated frame)
+        self._dragging       = False
+        self._drag_anchor_x  = 0.0
+        self._drag_anchor_y  = 0.0
+        self._drag_fov_x0    = 0.0
+        self._drag_fov_y0    = 0.0
+        self._mpl_cids: list = []
+
         # ── Tkinter variables ──────────────────────────────────────────────
         self.var_name       = tk.StringVar()
         self.var_ra         = tk.StringVar()
@@ -309,6 +322,9 @@ class FixedModePanel(ttk.Frame):
 
         self.btn_run = ttk.Button(fbtn, text="▶  実行", command=self._on_run, width=12)
         self.btn_run.pack(side="left", padx=(0, 8))
+        self.btn_optimize = ttk.Button(fbtn, text="🎯 最適化", command=self._on_optimize,
+                                       state="disabled", width=12)
+        self.btn_optimize.pack(side="left", padx=(0, 8))
         self.btn_save = ttk.Button(fbtn, text="💾 CSV 保存", command=self._on_save,
                                    state="disabled", width=12)
         self.btn_save.pack(side="left")
@@ -388,21 +404,40 @@ class FixedModePanel(ttk.Frame):
 
     # ── Plot ──────────────────────────────────────────────────────────────────
 
-    def _draw_plot(self, df: Optional[pd.DataFrame], fov_w: float, fov_h: float) -> None:
+    def _draw_plot(self, df: Optional[pd.DataFrame], fov_w: float, fov_h: float,
+                   cx: float = 0.0, cy: float = 0.0) -> None:
         self.ax.clear()
         half_w = fov_w / 2
         half_h = fov_h / 2
-        margin  = max(fov_w, fov_h) * 0.18
+        R = circumscribed_radius(fov_w, fov_h)
 
+        # Search circle (query region)
+        if self._all_df is not None:
+            circ = plt.Circle((0, 0), R, fill=False, linestyle=":",
+                               edgecolor="#999999", linewidth=1.2, alpha=0.7,
+                               label=f"検索円 (R={R:.1f}′)", zorder=1)
+            self.ax.add_patch(circ)
+
+        # FoV rectangle (at current offset)
         rect = mpatches.Rectangle(
-            (-half_w, -half_h), fov_w, fov_h,
-            linewidth=1.8, edgecolor="#2255aa", facecolor="none",
-            linestyle="--", label="FoV boundary")
+            (cx - half_w, cy - half_h), fov_w, fov_h,
+            linewidth=1.8, edgecolor="#2255aa", facecolor="#e8f0ff",
+            linestyle="--", alpha=0.25, label="FoV boundary", zorder=2)
         self.ax.add_patch(rect)
+        rect_border = mpatches.Rectangle(
+            (cx - half_w, cy - half_h), fov_w, fov_h,
+            linewidth=1.8, edgecolor="#2255aa", facecolor="none",
+            linestyle="--", zorder=3)
+        self.ax.add_patch(rect_border)
 
-        self.ax.scatter([0], [0], s=250, c="gold", marker="*",
-                        zorder=6, label="Target (centre)",
+        # Target star (always at origin)
+        in_fov = abs(cx) <= half_w and abs(cy) <= half_h
+        self.ax.scatter([0], [0], s=250, c="gold", marker="*", zorder=7,
+                        label="Target" + (" (FoV内)" if in_fov else " (FoV外)"),
                         edgecolors="#cc8800", linewidths=0.8)
+        if not in_fov:
+            self.ax.scatter([0], [0], s=350, c="none", marker="o",
+                            edgecolors="red", linewidths=1.5, zorder=8)
 
         n_usable = 0
         if df is not None and not df.empty and "x_arcmin" in df.columns:
@@ -431,8 +466,11 @@ class FixedModePanel(ttk.Frame):
                          ha="center", va="center", color="#888888",
                          fontsize=12, style="italic")
 
-        self.ax.set_xlim(half_w + margin, -half_w - margin)
-        self.ax.set_ylim(-half_h - margin, half_h + margin)
+        # Axis limits: show full search circle + margin
+        margin = R * 0.18 if self._all_df is not None else max(fov_w, fov_h) * 0.18
+        lim = R + margin if self._all_df is not None else half_w + margin
+        self.ax.set_xlim(lim, -lim)
+        self.ax.set_ylim(-lim, lim)
         self.ax.set_aspect("equal", adjustable="box")
         self.ax.set_xlabel("ΔRA  [arcmin]  (East →←)", fontsize=10)
         self.ax.set_ylabel("ΔDec  [arcmin]", fontsize=10)
@@ -440,16 +478,23 @@ class FixedModePanel(ttk.Frame):
         if df is not None and "usable" in df.columns:
             assessment = (self._summary or {}).get("assessment", "")
             color = ASSESS_COLORS.get(assessment, "black")
+            offset_str = f"  offset ({cx:+.1f}′, {cy:+.1f}′)" if (cx != 0 or cy != 0) else ""
             self.ax.set_title(
-                f"Reference Stars  [{assessment}]  ({n_usable} usable)",
+                f"Reference Stars  [{assessment}]  ({n_usable} usable){offset_str}",
                 fontsize=11, color=color, fontweight="bold")
         else:
-            self.ax.set_title("Reference Star Preview", fontsize=11)
+            self.ax.set_title("Reference Star Preview  (FoVをドラッグして移動可)", fontsize=11)
+
+        if self._all_df is not None:
+            self.ax.text(0.01, 0.01,
+                         "FoV をドラッグして移動  |  [🎯 最適化] で自動位置決め",
+                         transform=self.ax.transAxes, fontsize=8,
+                         color="#666666", va="bottom")
 
         self.ax.legend(loc="upper right", fontsize=9, framealpha=0.8)
         self.ax.grid(True, alpha=0.25, linestyle=":")
         self.fig.tight_layout(pad=2.0)
-        self.canvas.draw()
+        self.canvas.draw_idle()
 
     # ── Name search ───────────────────────────────────────────────────────────
 
@@ -615,6 +660,34 @@ class FixedModePanel(ttk.Frame):
 
         threading.Thread(target=self._run_query, args=(params,), daemon=True).start()
 
+    def _annotate_stars(self, raw_df: pd.DataFrame, center, pa_deg: float) -> pd.DataFrame:
+        """Project all stars to PA-rotated tangent plane and add separation column."""
+        import astropy.units as _u
+        from astropy.coordinates import SkyCoord as _SC
+        stars = _SC(ra=raw_df["ra_deg"].values * _u.deg,
+                    dec=raw_df["dec_deg"].values * _u.deg, frame="icrs")
+        dra  = ((stars.ra - center.ra).wrap_at(180 * _u.deg).deg
+                * np.cos(np.deg2rad(center.dec.deg)))
+        ddec = (stars.dec - center.dec).deg
+        dra_am, ddec_am = dra * 60.0, ddec * 60.0
+        pa_rad = np.deg2rad(pa_deg)
+        c, s = np.cos(pa_rad), np.sin(pa_rad)
+        df = raw_df.copy()
+        df["x_arcmin"] = dra_am * c - ddec_am * s
+        df["y_arcmin"] = dra_am * s + ddec_am * c
+        return add_separation(df, center)
+
+    def _filter_at_offset(self, cx: float, cy: float) -> pd.DataFrame:
+        """Return quality-filtered df for FoV centred at (cx, cy) offset in arcmin."""
+        fov_w, fov_h = self._get_fov()
+        p = self._query_params
+        df = self._all_df
+        inside = ((df["x_arcmin"] - cx).abs() <= fov_w / 2) & \
+                 ((df["y_arcmin"] - cy).abs() <= fov_h / 2)
+        return apply_quality_filters(
+            df[inside].copy(), p["catalog"], p["mag_min"], p["mag_max"],
+            p["max_err"], p["min_sep"])
+
     def _run_query(self, params: dict) -> None:
         try:
             center = parse_coord(params["ra"], params["dec"])
@@ -650,17 +723,20 @@ class FixedModePanel(ttk.Frame):
         if raw_df.empty:
             empty = pd.DataFrame(columns=OUTPUT_COLUMNS)
             summ  = summarize(empty, 0, 0, thr_good, thr_ok, thr_marg)
-            self.after(0, self._finish_ok, empty, summ, fov_w, fov_h)
+            self.after(0, self._finish_ok, empty, summ, fov_w, fov_h, center, params, None)
             return
 
-        fov_df      = filter_rectangular_fov(raw_df, center, fov_w, fov_h, pa_deg)
+        # Annotate ALL stars in the search circle (x_arcmin, y_arcmin, separation)
+        all_df = self._annotate_stars(raw_df, center, pa_deg)
+
+        # Initial FoV filter at centre (0, 0)
+        fov_df      = all_df[(all_df["x_arcmin"].abs() <= fov_w / 2) &
+                             (all_df["y_arcmin"].abs() <= fov_h / 2)].copy()
         n_fov       = len(fov_df)
-        fov_df      = add_separation(fov_df, center)
-        filtered_df = apply_quality_filters(
-            fov_df, catalog, mag_min, mag_max, max_err, min_sep)
+        filtered_df = apply_quality_filters(fov_df, catalog, mag_min, mag_max, max_err, min_sep)
         summ        = summarize(filtered_df, n_raw, n_fov, thr_good, thr_ok, thr_marg)
 
-        self.after(0, self._finish_ok, filtered_df, summ, fov_w, fov_h)
+        self.after(0, self._finish_ok, filtered_df, summ, fov_w, fov_h, center, params, all_df)
 
     def _finish_error(self, msg: str) -> None:
         self._running = False
@@ -668,35 +744,166 @@ class FixedModePanel(ttk.Frame):
         self.lbl_status.config(text=f"エラー: {msg}", foreground="#cc0000")
 
     def _finish_ok(self, df: pd.DataFrame, summary: dict,
-                   fov_w: float, fov_h: float) -> None:
-        self._result_df = df
-        self._summary   = summary
-        self._running   = False
+                   fov_w: float, fov_h: float,
+                   center=None, params: Optional[dict] = None,
+                   all_df: Optional[pd.DataFrame] = None) -> None:
+        self._result_df    = df
+        self._summary      = summary
+        self._running      = False
+        self._all_df       = all_df
+        self._query_center = center
+        self._query_params = params
+        self._fov_cx       = 0.0
+        self._fov_cy       = 0.0
 
         self.btn_run.config(state="normal", text="▶  実行")
         self.btn_save.config(state="normal")
-        self.lbl_status.config(text="完了", foreground="#1a7a1a")
-        self._draw_plot(df, fov_w, fov_h)
+        drag_ok = all_df is not None and not all_df.empty
+        self.btn_optimize.config(state="normal" if drag_ok else "disabled")
+        self.lbl_status.config(
+            text="完了  — FoVをドラッグして移動できます" if drag_ok else "完了",
+            foreground="#1a7a1a")
 
+        self._draw_plot(df, fov_w, fov_h, cx=0.0, cy=0.0)
+        self._update_summary(summary)
+        if drag_ok:
+            self._connect_drag()
+
+    def _update_summary(self, summary: dict) -> None:
         assessment    = summary.get("assessment", "?")
         n_usable      = summary.get("n_usable", 0)
         reject_counts = summary.get("reject_counts", {})
-
+        cx, cy = self._fov_cx, self._fov_cy
+        offset_str = (f"  |  FoV中心 ({cx:+.2f}′, {cy:+.2f}′)"
+                      if (cx != 0 or cy != 0) else "")
         parts = [
             f"Raw (外接円): {summary.get('n_raw', 0)}",
             f"FoV 内: {summary.get('n_fov', 0)}",
             f"近傍除外: {summary.get('n_rejected_near_asteroid', 0)}",
             f"使用可能: {n_usable} 星",
-            f"判定: {assessment}",
+            f"判定: {assessment}{offset_str}",
         ]
         if reject_counts:
             detail = "  ".join(
                 f"{r}: {c}"
                 for r, c in sorted(reject_counts.items(), key=lambda x: -x[1]))
             parts.append(f"除外理由 → {detail}")
-
         color = ASSESS_COLORS.get(assessment, "#000000")
         self.lbl_summary.config(text="     ".join(parts), foreground=color)
+
+    # ── FoV drag ─────────────────────────────────────────────────────────────
+
+    def _connect_drag(self) -> None:
+        for cid in self._mpl_cids:
+            self.canvas.mpl_disconnect(cid)
+        self._mpl_cids = [
+            self.canvas.mpl_connect("button_press_event",   self._on_drag_start),
+            self.canvas.mpl_connect("motion_notify_event",  self._on_drag_motion),
+            self.canvas.mpl_connect("button_release_event", self._on_drag_end),
+        ]
+
+    def _on_drag_start(self, event) -> None:
+        if (event.inaxes != self.ax or event.button != 1
+                or self._all_df is None
+                or getattr(self.toolbar, "mode", "") != ""):
+            return
+        fov_w, fov_h = self._get_fov()
+        cx, cy = self._fov_cx, self._fov_cy
+        if (abs(event.xdata - cx) <= fov_w / 2 and
+                abs(event.ydata - cy) <= fov_h / 2):
+            self._dragging      = True
+            self._drag_anchor_x = event.xdata
+            self._drag_anchor_y = event.ydata
+            self._drag_fov_x0   = cx
+            self._drag_fov_y0   = cy
+
+    def _on_drag_motion(self, event) -> None:
+        if not self._dragging or event.inaxes != self.ax or event.xdata is None:
+            return
+        fov_w, fov_h = self._get_fov()
+        R = circumscribed_radius(fov_w, fov_h)
+        new_cx = self._drag_fov_x0 + (event.xdata - self._drag_anchor_x)
+        new_cy = self._drag_fov_y0 + (event.ydata - self._drag_anchor_y)
+        dist = np.hypot(new_cx, new_cy)
+        if dist > R:
+            new_cx *= R / dist
+            new_cy *= R / dist
+        self._fov_cx = new_cx
+        self._fov_cy = new_cy
+        filtered = self._filter_at_offset(new_cx, new_cy)
+        self._draw_plot(filtered, fov_w, fov_h, cx=new_cx, cy=new_cy)
+
+    def _on_drag_end(self, event) -> None:
+        if not self._dragging:
+            return
+        self._dragging  = False
+        cx, cy = self._fov_cx, self._fov_cy
+        fov_w, fov_h = self._get_fov()
+        filtered = self._filter_at_offset(cx, cy)
+        self._result_df = filtered
+        p = self._query_params
+        thr_good = p["thr_good"]
+        thr_ok   = p["thr_ok"]
+        thr_marg = p["thr_marg"]
+        n_fov = int(((filtered["x_arcmin"].abs() <= fov_w / 2) &
+                     (filtered["y_arcmin"].abs() <= fov_h / 2)).sum())
+        summ = summarize(filtered, len(self._all_df), n_fov, thr_good, thr_ok, thr_marg)
+        self._summary = summ
+        self._update_summary(summ)
+
+    # ── Optimize ─────────────────────────────────────────────────────────────
+
+    def _on_optimize(self) -> None:
+        if self._all_df is None:
+            return
+        self.btn_optimize.config(state="disabled", text="⏳ 最適化中...")
+        self.btn_run.config(state="disabled")
+        threading.Thread(target=self._do_optimize, daemon=True).start()
+
+    def _do_optimize(self) -> None:
+        fov_w, fov_h = self._get_fov()
+        R = circumscribed_radius(fov_w, fov_h)
+        n_grid = 40
+        xs = np.linspace(-R, R, n_grid)
+        ys = np.linspace(-R, R, n_grid)
+        best_cx, best_cy, best_n = 0.0, 0.0, -1
+        df = self._all_df
+        half_w, half_h = fov_w / 2, fov_h / 2
+        p = self._query_params
+
+        for cx in xs:
+            for cy in ys:
+                if cx ** 2 + cy ** 2 > R ** 2:
+                    continue
+                inside = ((df["x_arcmin"] - cx).abs() <= half_w) & \
+                         ((df["y_arcmin"] - cy).abs() <= half_h)
+                sub = df[inside]
+                if sub.empty:
+                    continue
+                filtered = apply_quality_filters(
+                    sub.copy(), p["catalog"], p["mag_min"], p["mag_max"],
+                    p["max_err"], p["min_sep"])
+                n = int(filtered["usable"].sum())
+                if n > best_n:
+                    best_n, best_cx, best_cy = n, cx, cy
+
+        self.after(0, self._finish_optimize, best_cx, best_cy)
+
+    def _finish_optimize(self, cx: float, cy: float) -> None:
+        self._fov_cx = cx
+        self._fov_cy = cy
+        fov_w, fov_h = self._get_fov()
+        filtered = self._filter_at_offset(cx, cy)
+        self._result_df = filtered
+        p = self._query_params
+        n_fov = len(filtered)
+        summ = summarize(filtered, len(self._all_df), n_fov,
+                         p["thr_good"], p["thr_ok"], p["thr_marg"])
+        self._summary = summ
+        self._draw_plot(filtered, fov_w, fov_h, cx=cx, cy=cy)
+        self._update_summary(summ)
+        self.btn_optimize.config(state="normal", text="🎯 最適化")
+        self.btn_run.config(state="normal")
 
     # ── Save ─────────────────────────────────────────────────────────────────
 
