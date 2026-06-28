@@ -676,10 +676,10 @@ class VariableModePanel(ttk.Frame):
         fsum = ttk.LabelFrame(right, text="📈 サマリ (現在のエポック)", padding=8)
         fsum.grid(row=6, column=0, sticky="ew", pady=(8, 0))
         fsum.columnconfigure(0, weight=1)
+        _txt_bg = ttk.Style().lookup("TFrame", "background") or "systemWindowBackgroundColor"
         self.txt_summary = tk.Text(
             fsum, height=4, font=("Menlo", 10), relief="flat",
-            background=fsum.cget("background") if hasattr(fsum, "cget") else "#f0f0f0",
-            state="disabled", cursor="arrow", wrap="word",
+            background=_txt_bg, state="disabled", cursor="arrow", wrap="word",
             borderwidth=0)
         self.txt_summary.grid(row=0, column=0, sticky="ew")
         self.txt_summary.tag_configure("colored", foreground="#333333")
