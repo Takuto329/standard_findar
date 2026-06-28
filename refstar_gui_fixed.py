@@ -439,6 +439,18 @@ class FixedModePanel(ttk.Frame):
             self.ax.scatter([0], [0], s=350, c="none", marker="o",
                             edgecolors="red", linewidths=1.5, zorder=8)
 
+        # Stars outside the current FoV (from full search cache)
+        if self._all_df is not None and "x_arcmin" in self._all_df.columns:
+            outside_mask = ((self._all_df["x_arcmin"] - cx).abs() > half_w) | \
+                           ((self._all_df["y_arcmin"] - cy).abs() > half_h)
+            outside = self._all_df[outside_mask]
+            if not outside.empty:
+                self.ax.scatter(
+                    outside["x_arcmin"], outside["y_arcmin"],
+                    s=25, c="none", marker="o", alpha=0.45,
+                    zorder=3, label=f"FoV外  ({len(outside)})",
+                    edgecolors="#cc4444", linewidths=0.8)
+
         n_usable = 0
         if df is not None and not df.empty and "x_arcmin" in df.columns:
             usable   = df[df["usable"]]
