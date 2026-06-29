@@ -48,19 +48,10 @@ from refstar_planner import (
 # ---------------------------------------------------------------------------
 
 TELESCOPE_PRESETS: list[tuple[str, Optional[tuple[float, float]]]] = [
-    ("すばる 8.2m / HSC",            (90.0, 90.0)),
-    ("すばる 8.2m / FOCAS",          (6.0,  6.0)),
-    ("すばる 8.2m / IRCS (no AO)",   (0.9,  0.9)),
-    ("京大 Seimei 3.8m / TriCCS",    (8.3,  8.3)),
+    ("京大 Seimei 3.8m / TriCCS",    (12.6,  7.5)),
     ("OAO 188cm / MuSCAT",            (6.1,  6.1)),
-    ("Nayuta 2m / MSI",               (9.4,  9.4)),
-    ("TNG 3.6m / MuSCAT2",            (7.4,  7.4)),
-    ("Haleakala 2m / MuSCAT3",        (9.1,  9.1)),
-    ("Keck 10m / LRIS",               (6.0,  7.8)),
-    ("Keck 10m / DEIMOS",             (16.7, 5.0)),
-    ("VLT 8.2m / FORS2",              (6.8,  6.8)),
-    ("Gemini 8.1m / GMOS",            (5.5,  5.5)),
-    ("ksirius",                        (3.7, 2.9)),
+    ("Nayuta 2m / MSI",               (3.3,  3.3)),
+    ("入来 kSIRIUS",                        (3.7, 2.9)),
     ("Custom",                         None),
 ]
 
